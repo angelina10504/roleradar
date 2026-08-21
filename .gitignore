@@ -1,0 +1,29 @@
+# Secrets
+.env
+.env.local
+*.key
+*.pem
+
+# GCP service account keys. Never commit these.
+gcp-*.json
+service-account*.json
+credentials.json
+
+# Node (validator/)
+node_modules/
+npm-debug.log*
+
+# Python (api/)
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# n8n local state, mounted by docker-compose
+n8n_data/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
