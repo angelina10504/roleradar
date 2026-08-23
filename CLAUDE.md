@@ -6,20 +6,23 @@ Context file for Claude Code sessions on this repo. Read it fully before working
 
 A scheduled pipeline that pulls remote job postings, uses an LLM to extract
 structured fields, validates that output with deterministic code, routes failures
-to a dead-letter table, writes to BigQuery, and surfaces it in a dashboard.
+to a dead-letter table, writes to Postgres, and surfaces it in a dashboard.
 
 The meta angle: it tracks postings that mention n8n, and it is built with n8n.
 
 It is also a learning project. The owner is a final-year CS student who is strong
-in Python, SQL, FastAPI, Docker, AWS, and React, and has never used n8n, GCP, or
+in Python, SQL, FastAPI, Docker, AWS, and React, and had never used n8n, GCP, or
 BigQuery. The point is to close those gaps and be able to defend every design
 decision in an interview. Explaining beats delivering.
+
+The warehouse is Postgres, not BigQuery. See "Why Postgres" below. The GCP gap
+is therefore not closed by this project.
 
 ## Done looks like
 
 - n8n running in Docker, with the workflow built by hand in the canvas.
 - Validator passing its tests against real captured fixtures, not invented ones.
-- Both BigQuery tables populated, including at least one deliberate dead-letter
+- Both Postgres tables populated, including at least one deliberate dead-letter
   row. A dead letter table that has never been exercised is not evidence of
   anything.
 - Dashboard rendering from real warehouse data.
@@ -38,8 +41,8 @@ Schedule Trigger (n8n cron)
        Forced tool use, so the response conforms to input_schema.
        Nothing is parsed out of free text.
   -> Code node (JS) running a copy of validator/validate.js
-  -> IF valid -> BigQuery jobs_extracted
-     else     -> BigQuery dead_letter_log
+  -> IF valid -> Postgres jobs_extracted
+     else     -> Postgres dead_letter_log
 ```
 
 A separate n8n **Error Trigger** workflow catches infra failures: timeouts,
@@ -47,7 +50,7 @@ non-2xx responses, API outages. This is deliberately distinct from data
 validation failures. An HTTP 529 from Anthropic is not the same event as a model
 returning a bad `seniority` value, and mixing them makes both un-diagnosable.
 
-Downstream: BigQuery -> FastAPI (`/stats`, `/jobs`) -> Chart.js page.
+Downstream: Postgres -> FastAPI (`/stats`, `/jobs`) -> Chart.js page.
 
 ## Extraction schema
 
@@ -67,6 +70,23 @@ The `input_schema` of the `extract_job_fields` tool, and how it lands in
 | `mentions_n8n` | boolean | the model's claim. Stored as `mentions_n8n_model`. See (c) |
 | `mentions_n8n_actual` | boolean | **not in the tool schema.** Computed by the validator. See (c) |
 | `ai_ml_role` | boolean | |
+
+## Why Postgres
+
+The design was written for BigQuery. It runs on Postgres 16 in Docker, alongside
+n8n.
+
+BigQuery's Sandbox, the tier available without putting a card on file, blocks
+streaming inserts and DML. n8n's BigQuery node writes with `insertAll`, which is
+the streaming insert API, so the node cannot write to a Sandbox project at all.
+The choice was to attach a billing card, hand-build load jobs through an Execute
+Query node, or use a warehouse that accepts ordinary inserts. Postgres in the
+existing compose file was the smallest change that kept the pipeline running end
+to end, and it costs nothing.
+
+Only the engine changed. Append-only, dedupe-on-read, the split between the two
+tables, the provenance columns, and the validator contract were warehouse
+decisions, not BigQuery decisions, and all of them still hold.
 
 ## Decisions
 
@@ -89,12 +109,20 @@ An immutable ingestion log keeps the raw record of what was seen when, and the
 view derives current state on read. Reads are cheap at this scale; lost history
 is not recoverable.
 
-**Secondary reason:** n8n's BigQuery node inserts. It does not MERGE. A MERGE
-would mean an Execute Query node with hand-built SQL and string quoting risk.
+**Secondary reason:** n8n's Postgres node inserts. Reaching for `INSERT ... ON
+CONFLICT` would mean an Execute Query node with hand-built SQL and string
+quoting risk.
 
-The table is partitioned on `DATE(ingested_at)` and clustered on `source_job_id`.
-Partitioning bounds the scan for time-range charts; clustering makes the
-`PARTITION BY source_job_id` window in the view cheap.
+`jobs_extracted` has a `BIGSERIAL` primary key on `id`. `source_job_id` is NOT
+NULL but deliberately **not** unique: one posting seen on three runs is three
+rows. A unique key on `source_job_id` would make the table upsert-shaped and
+silently reject the second sighting, which is the history the design exists to
+keep. An earlier version had exactly that bug.
+
+The index is on `(source_job_id, ingested_at DESC)`, which is the key order the
+view's window needs. On BigQuery this was partitioning on `DATE(ingested_at)`
+plus clustering on `source_job_id`; the intent is the same, the mechanism is
+what the engine offers.
 
 ### (b) Provenance columns and the validator contract
 
@@ -104,7 +132,7 @@ ten schema fields become eleven columns, because `mentions_n8n` splits into
 
 | column | source | notes |
 |---|---|---|
-| `source_job_id` | Remotive | type unresolved. See below. |
+| `source_job_id` | Remotive | `text`. Coerced from Remotive's number by the validator. |
 | `source_url` | Remotive | |
 | `raw_title` | Remotive | |
 | `raw_company` | Remotive | |
@@ -128,12 +156,11 @@ postings-over-time chart needs to distinguish them. `validate.js` does not put
 it on either record yet, and `validate.test.js` asserts the exact record shape,
 so adding it is a code change plus a test change. Open item.
 
-**`source_job_id` type is unresolved.** Remotive returns it as a number.
+**`source_job_id` type: resolved.** Remotive returns it as a number.
 `validate.js` coerces it to a string on the record, so the column type does not
 depend on what the API feels like sending, and so the `PARTITION BY
 source_job_id` window in the view stays stable across a format change upstream.
-The BigQuery DDL is not written yet. When it is, it has to agree with that
-coercion — STRING, not INT64 — or the insert fails.
+The column is `text`, matching the coercion.
 
 The full job description is **not** written to `jobs_extracted`. Descriptions are
 long HTML and would dominate the table's storage for no query benefit. It is
@@ -196,11 +223,13 @@ sanity-check the invariant.
 
 ## Division of labour
 
-**Claude owns the repo:** validator and its tests, docker-compose for n8n,
-BigQuery DDL, FastAPI dashboard, Chart.js frontend, README, this file.
+**Claude owns the repo:** validator and its tests, docker-compose for n8n and
+Postgres, Postgres DDL, FastAPI dashboard, Chart.js frontend, README, this file.
 
-**The owner owns:** building the n8n workflow by hand in the canvas, and all GCP
-console setup (project, API enablement, service account, IAM).
+**The owner owns:** building the n8n workflow by hand in the canvas, and running
+the DDL against the database. Tables were created by hand in `psql`, so the
+files in `sql/` document the live schema rather than create it. Nothing enforces
+that they stay in sync.
 
 **Do not generate n8n workflow JSON for import.** That is the part being learned.
 Naming node types and explaining why to reach for them is fine and useful. Wiring
@@ -221,24 +250,22 @@ them is not Claude's job. Notes for that live in `docs/n8n-notes.md`.
 
 ## Costs
 
-Two line items are not free. Both are small here. Neither is zero.
+One line item is not free.
 
 - **Anthropic API.** No free tier, prepaid credits. One call per job item, so the
-  Split node cap is the cost control. A dev loop that forgets the cap and pulls
+  Limit node cap is the cost control. A dev loop that forgets the cap and pulls
   500 postings per run costs real money.
-- **BigQuery streaming inserts.** n8n's BigQuery node uses `insertAll`, billed
-  per GB with no free allowance. Fractions of a cent at this row volume, but it
-  never rounds to zero.
 
-BigQuery storage and queries stay inside the free tier at this scale. n8n
-self-hosted in Docker is free. GCP project creation is free.
+Postgres and n8n are both self-hosted in Docker and cost nothing. The BigQuery
+streaming-insert cost that used to be listed here no longer applies, since
+nothing writes to BigQuery.
 
 ## Repo layout
 
 ```
 CLAUDE.md              this file
 README.md              setup and run instructions
-docker-compose.yml     n8n, at root so `docker compose up` needs no -f
+docker-compose.yml     n8n and Postgres, at root so `docker compose up` needs no -f
 .env.example           documented config, no real values
 validator/
   package.json         zero dependencies, on purpose

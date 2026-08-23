@@ -1,0 +1,802 @@
+{
+  "name": "My workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {}
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        0,
+        0
+      ],
+      "id": "f50d8a7e-f912-4609-a66f-9f40384cb508",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "url": "https://remotive.com/api/remote-jobs?search=python",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"model\": \"claude-haiku-4-5-20251001\",\n  \"max_tokens\": 50,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Reply with exactly the word WORKING\"\n    }\n  ]\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        192,
+        0
+      ],
+      "id": "a94dcbfb-dceb-4db2-85e6-a6a95dd79f88",
+      "name": "HTTP Request"
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "jobs",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        368,
+        0
+      ],
+      "id": "14e9e399-bb03-4307-8b65-7a2d21a19b85",
+      "name": "Split Out"
+    },
+    {
+      "parameters": {
+        "maxItems": 5
+      },
+      "type": "n8n-nodes-base.limit",
+      "typeVersion": 1,
+      "position": [
+        544,
+        0
+      ],
+      "id": "b14e2d85-1409-4541-8a58-c03f0d4429ed",
+      "name": "Limit"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"claude-haiku-4-5-20251001\",\n  \"max_tokens\": 1024,\n  \"tools\": [\n    {\n      \"name\": \"extract_job_fields\",\n      \"description\": \"Extract structured fields from a job posting.\",\n      \"input_schema\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"normalized_title\": { \"type\": \"string\", \"description\": \"Job title, normalized. Strip location, seniority markers, and req numbers.\" },\n          \"company\": { \"type\": \"string\" },\n          \"seniority\": { \"type\": \"string\", \"enum\": [\"junior\", \"mid\", \"senior\", \"lead\", \"unspecified\"] },\n          \"tech_stack\": { \"type\": \"array\", \"items\": { \"type\": \"string\" }, \"maxItems\": 30, \"description\": \"Technologies explicitly named in the posting. Do not infer.\" },\n          \"remote_type\": { \"type\": \"string\", \"enum\": [\"remote\", \"hybrid\", \"onsite\", \"unspecified\"] },\n          \"salary_min\": { \"type\": [\"number\", \"null\"], \"description\": \"Lower bound as stated. Do not convert units.\" },\n          \"salary_max\": { \"type\": [\"number\", \"null\"], \"description\": \"Upper bound as stated. Do not convert units.\" },\n          \"salary_period\": { \"type\": \"string\", \"enum\": [\"hourly\", \"monthly\", \"yearly\", \"unspecified\"] },\n          \"mentions_n8n\": { \"type\": \"boolean\", \"description\": \"True if and only if the posting text contains the literal token n8n. This is a substring check, not a judgment about whether the role involves n8n.\" },\n          \"ai_ml_role\": { \"type\": \"boolean\", \"description\": \"True if the core responsibilities involve machine learning, AI systems, or data science.\" }\n        },\n        \"required\": [\"normalized_title\", \"company\", \"seniority\", \"tech_stack\", \"remote_type\", \"salary_min\", \"salary_max\", \"salary_period\", \"mentions_n8n\", \"ai_ml_role\"]\n      }\n    }\n  ],\n  \"tool_choice\": { \"type\": \"tool\", \"name\": \"extract_job_fields\" },\n  \"messages\": [\n    { \"role\": \"user\", \"content\": {{ JSON.stringify(\"Extract structured fields from this job posting.\\n\\nTitle: \" + $json.raw_title + \"\\nCompany: \" + $json.raw_company + \"\\n\\nDescription:\\n\" + $json.description_clean) }} }\n  ]\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        944,
+        0
+      ],
+      "id": "63ba16bc-c7e4-4cdb-a278-4c0dbe3142ab",
+      "name": "Claude Extract",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "XQBYrv9izyXxWdjg",
+          "name": "Header Auth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const j = $input.item.json;\n\nconst clean = (j.description || '')\n  .replace(/<[^>]*>/g, ' ')\n  .replace(/&nbsp;/g, ' ')\n  .replace(/&amp;/g, '&')\n  .replace(/\\s+/g, ' ')\n  .trim()\n  .slice(0, 6000);\n\nreturn {\n  json: {\n    source_job_id: j.id,\n    source_url: j.url,\n    raw_title: j.title,\n    raw_company: j.company_name,\n    publication_date: j.publication_date,\n    description_clean: clean\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        736,
+        0
+      ],
+      "id": "98e2bad0-1b01-4c8d-907c-26c10b7abdee",
+      "name": "Prep"
+    },
+    {
+      "parameters": {
+        "jsCode": "'use strict';\n\n/**\n * RoleRadar extraction validator.\n *\n * Source of truth for the validation logic. A copy of this file runs inside the\n * n8n Code node, pasted by hand. There is no import path from the canvas into\n * this repo, so the two can drift. See CLAUDE.md, \"Known duplication\".\n *\n * The whole file is safe to paste into the Code node unchanged: the export at\n * the bottom is guarded, so it is a no-op where `module` does not exist.\n *\n *   validate({ source, extracted }, ingestedAt) -> { valid, errors, record }\n *\n * Pure. No clock, no I/O, no dependencies. `ingestedAt` is an argument so tests\n * are deterministic.\n *\n * `extracted` is the full Anthropic message, not the tool input. It is the only\n * place the `model` provenance value exists, and unwrapping it here keeps that\n * step inside the tested module rather than in the hand-pasted Code node.\n */\n\n/** Bumped when the tool schema or the checks below change. Stored per row so\n *  rows stay comparable across versions. */\nconst EXTRACTION_VERSION = '1.0.0';\n\nconst TOOL_NAME = 'extract_job_fields';\n\nconst SENIORITY = ['junior', 'mid', 'senior', 'lead', 'unspecified'];\nconst REMOTE_TYPE = ['remote', 'hybrid', 'onsite', 'unspecified'];\nconst SALARY_PERIOD = ['hourly', 'monthly', 'yearly', 'unspecified'];\n\n/** Keys the tool's input_schema may emit. Anything else is drift. */\nconst SCHEMA_FIELDS = [\n  'normalized_title',\n  'company',\n  'seniority',\n  'tech_stack',\n  'remote_type',\n  'salary_min',\n  'salary_max',\n  'salary_period',\n  'mentions_n8n',\n  'ai_ml_role',\n];\n\n/** Provenance fields the pipeline cannot trace a row without. */\nconst REQUIRED_SOURCE_STRINGS = [\n  'source_url',\n  'raw_title',\n  'raw_company',\n  'description_clean',\n];\n\nconst MAX_TECH_STACK = 30;\n\n/** Real salary ranges do not span 60x. A range wider than this is the model\n *  conflating two different numbers, not a band. See CLAUDE.md. */\nconst MAX_SALARY_SPAN_RATIO = 20;\n\n/** Deliberately narrow: the token, not the concept. Non-global, so there is no\n *  lastIndex to reset between calls. */\nconst N8N_TOKEN = /\\bn8n\\b/i;\n\nfunction err(field, code, message) {\n  return { field, code, message };\n}\n\n/** Idempotent on the already-clean descriptions Remotive returns; present so\n *  the check still holds if raw HTML is ever piped in instead. */\nfunction stripTags(text) {\n  return String(text).replace(/<[^>]*>/g, ' ');\n}\n\nfunction isNonEmptyString(value) {\n  return typeof value === 'string' && value.trim() !== '';\n}\n\nfunction checkRequiredString(errors, field, value) {\n  if (value === undefined || value === null) {\n    errors.push(err(field, 'MISSING', `${field} is required`));\n    return false;\n  }\n  if (typeof value !== 'string') {\n    errors.push(err(field, 'TYPE', `${field} must be a string, got ${typeof value}`));\n    return false;\n  }\n  if (value.trim() === '') {\n    errors.push(err(field, 'EMPTY', `${field} must not be empty`));\n    return false;\n  }\n  return true;\n}\n\nfunction checkEnum(errors, field, value, allowed) {\n  if (value === undefined || value === null) {\n    errors.push(err(field, 'MISSING', `${field} is required`));\n    return false;\n  }\n  if (typeof value !== 'string') {\n    errors.push(err(field, 'TYPE', `${field} must be a string, got ${typeof value}`));\n    return false;\n  }\n  if (allowed.indexOf(value) === -1) {\n    errors.push(\n      err(field, 'ENUM', `${field} must be one of ${allowed.join(', ')}, got ${value}`)\n    );\n    return false;\n  }\n  return true;\n}\n\nfunction checkBoolean(errors, field, value) {\n  if (value === undefined || value === null) {\n    errors.push(err(field, 'MISSING', `${field} is required`));\n    return false;\n  }\n  if (typeof value !== 'boolean') {\n    errors.push(err(field, 'TYPE', `${field} must be a boolean, got ${typeof value}`));\n    return false;\n  }\n  return true;\n}\n\nfunction checkTechStack(errors, value) {\n  if (value === undefined || value === null) {\n    errors.push(err('tech_stack', 'MISSING', 'tech_stack is required'));\n    return false;\n  }\n  if (!Array.isArray(value)) {\n    errors.push(err('tech_stack', 'TYPE', `tech_stack must be an array, got ${typeof value}`));\n    return false;\n  }\n  let ok = true;\n  if (value.length > MAX_TECH_STACK) {\n    errors.push(\n      err(\n        'tech_stack',\n        'ARRAY_LEN',\n        `tech_stack must have at most ${MAX_TECH_STACK} items, got ${value.length}`\n      )\n    );\n    ok = false;\n  }\n  for (let i = 0; i < value.length; i++) {\n    if (!isNonEmptyString(value[i])) {\n      errors.push(\n        err('tech_stack', 'ARRAY_ITEM', `tech_stack[${i}] must be a non-empty string`)\n      );\n      ok = false;\n    }\n  }\n  return ok;\n}\n\n/**\n * A salary bound is a positive finite number or null. Zero is rejected: it is a\n * meaningless lower bound, and rejecting it means the span ratio below never\n * divides by zero.\n *\n * Returns 'number' | 'null' | 'invalid' so the cross-field checks know whether\n * they can trust the value.\n */\nfunction checkSalaryBound(errors, field, value) {\n  if (value === null) return 'null';\n  if (typeof value !== 'number') {\n    errors.push(\n      err(field, 'TYPE', `${field} must be a number or null, got ${value === undefined ? 'undefined' : typeof value}`)\n    );\n    return 'invalid';\n  }\n  if (!Number.isFinite(value) || value <= 0) {\n    errors.push(err(field, 'RANGE', `${field} must be a positive finite number, got ${value}`));\n    return 'invalid';\n  }\n  return 'number';\n}\n\n/** Runs only on bounds that passed their own checks, so one bad number does not\n *  cascade into three misleading errors. */\nfunction checkSalaryRelations(errors, input, minKind, maxKind, periodOk) {\n  if (minKind === 'invalid' || maxKind === 'invalid') return;\n\n  const min = input.salary_min;\n  const max = input.salary_max;\n\n  if (minKind === 'null' && maxKind === 'null') return;\n\n  if (minKind === 'null' || maxKind === 'null') {\n    errors.push(\n      err(\n        'salary_min',\n        'SALARY_PARTIAL',\n        'salary_min and salary_max must both be set or both be null'\n      )\n    );\n  } else if (min > max) {\n    errors.push(\n      err('salary_min', 'SALARY_ORDER', `salary_min (${min}) must not exceed salary_max (${max})`)\n    );\n  } else if (max / min > MAX_SALARY_SPAN_RATIO) {\n    errors.push(\n      err(\n        'salary_max',\n        'SALARY_SPAN_IMPLAUSIBLE',\n        `salary range spans ${(max / min).toFixed(1)}x (${min} to ${max}), over the ${MAX_SALARY_SPAN_RATIO}x limit; the bounds are probably different units`\n      )\n    );\n  }\n\n  // A number without a period is not a salary, it is a digit.\n  if (periodOk && input.salary_period === 'unspecified') {\n    errors.push(\n      err(\n        'salary_period',\n        'SALARY_PERIOD_MISMATCH',\n        'salary_period must not be unspecified when a salary bound is set'\n      )\n    );\n  }\n}\n\nfunction checkUnknownFields(errors, input) {\n  const keys = Object.keys(input);\n  for (let i = 0; i < keys.length; i++) {\n    if (SCHEMA_FIELDS.indexOf(keys[i]) === -1) {\n      errors.push(\n        err(keys[i], 'UNKNOWN_FIELD', `${keys[i]} is not in the ${TOOL_NAME} input_schema`)\n      );\n    }\n  }\n}\n\n/** Pulls the forced tool_use block out of the Anthropic message. Forced\n *  tool_choice makes absence unlikely but not impossible: a max_tokens stop\n *  returns a truncated message with no usable block. */\nfunction findToolInput(extracted) {\n  if (!extracted || typeof extracted !== 'object') return null;\n  const content = extracted.content;\n  if (!Array.isArray(content)) return null;\n  for (let i = 0; i < content.length; i++) {\n    const block = content[i];\n    if (\n      block &&\n      block.type === 'tool_use' &&\n      block.name === TOOL_NAME &&\n      block.input &&\n      typeof block.input === 'object' &&\n      !Array.isArray(block.input)\n    ) {\n      return block.input;\n    }\n  }\n  return null;\n}\n\nfunction deadLetterRecord(source, extracted, ingestedAt, errors) {\n  const seen = {};\n  const codes = [];\n  for (let i = 0; i < errors.length; i++) {\n    if (!seen[errors[i].code]) {\n      seen[errors[i].code] = true;\n      codes.push(errors[i].code);\n    }\n  }\n  return {\n    source_job_id: source && source.source_job_id != null ? String(source.source_job_id) : null,\n    source_url: source ? source.source_url ?? null : null,\n    raw_title: source ? source.raw_title ?? null : null,\n    raw_company: source ? source.raw_company ?? null : null,\n    ingested_at: ingestedAt,\n    model: extracted && typeof extracted.model === 'string' ? extracted.model : null,\n    extraction_version: EXTRACTION_VERSION,\n    // Kept here and nowhere else: too long for jobs_extracted, needed to\n    // diagnose the failure.\n    description_clean: source ? source.description_clean ?? null : null,\n    raw_output: JSON.stringify(extracted ?? null),\n    // Codes are the queryable dimension; the JSON is the payload you read when\n    // you open a row.\n    error_codes: codes,\n    errors_json: JSON.stringify(errors),\n  };\n}\n\nfunction validate(item, ingestedAt) {\n  const source = item ? item.source : undefined;\n  const extracted = item ? item.extracted : undefined;\n  const errors = [];\n\n  // --- source provenance -------------------------------------------------\n  // Separate from model errors on purpose: a missing source_job_id is a\n  // pipeline fault and should not inflate the model error rate.\n  if (!source || typeof source !== 'object') {\n    errors.push(err('source', 'MISSING', 'source is required'));\n  } else {\n    // Remotive emits a numeric id. The JSON type is theirs to choose, so this\n    // checks presence rather than type; the record coerces it to a string.\n    if (source.source_job_id === undefined || source.source_job_id === null || String(source.source_job_id).trim() === '') {\n      errors.push(err('source_job_id', 'MISSING', 'source_job_id is required'));\n    }\n    for (let i = 0; i < REQUIRED_SOURCE_STRINGS.length; i++) {\n      checkRequiredString(errors, REQUIRED_SOURCE_STRINGS[i], source[REQUIRED_SOURCE_STRINGS[i]]);\n    }\n  }\n\n  // --- envelope ----------------------------------------------------------\n  const input = findToolInput(extracted);\n  if (input === null) {\n    errors.push(\n      err(\n        'extracted',\n        'TOOL_USE_MISSING',\n        `no ${TOOL_NAME} tool_use block in the response (stop_reason: ${extracted && extracted.stop_reason ? extracted.stop_reason : 'unknown'})`\n      )\n    );\n    return {\n      valid: false,\n      errors: errors,\n      record: deadLetterRecord(source, extracted, ingestedAt, errors),\n    };\n  }\n\n  // --- schema ------------------------------------------------------------\n  checkRequiredString(errors, 'normalized_title', input.normalized_title);\n  checkRequiredString(errors, 'company', input.company);\n  checkEnum(errors, 'seniority', input.seniority, SENIORITY);\n  checkEnum(errors, 'remote_type', input.remote_type, REMOTE_TYPE);\n  const periodOk = checkEnum(errors, 'salary_period', input.salary_period, SALARY_PERIOD);\n  checkTechStack(errors, input.tech_stack);\n  const n8nOk = checkBoolean(errors, 'mentions_n8n', input.mentions_n8n);\n  checkBoolean(errors, 'ai_ml_role', input.ai_ml_role);\n\n  const minKind = checkSalaryBound(errors, 'salary_min', input.salary_min);\n  const maxKind = checkSalaryBound(errors, 'salary_max', input.salary_max);\n  checkSalaryRelations(errors, input, minKind, maxKind, periodOk);\n\n  checkUnknownFields(errors, input);\n\n  // --- model cross-check -------------------------------------------------\n  // Independent ground truth for mentions_n8n. Never corrects the value:\n  // overwriting would hide the error rate, which is the point of measuring it.\n  const descriptionUsable = !!source && isNonEmptyString(source.description_clean);\n  const mentionsN8nActual = descriptionUsable\n    ? N8N_TOKEN.test(stripTags(source.description_clean))\n    : false;\n\n  if (n8nOk && descriptionUsable && input.mentions_n8n !== mentionsN8nActual) {\n    errors.push(\n      err(\n        'mentions_n8n',\n        'N8N_MISMATCH',\n        `model said ${input.mentions_n8n}, description ${mentionsN8nActual ? 'contains' : 'does not contain'} the token n8n`\n      )\n    );\n  }\n\n  if (errors.length > 0) {\n    return {\n      valid: false,\n      errors: errors,\n      record: deadLetterRecord(source, extracted, ingestedAt, errors),\n    };\n  }\n\n  return {\n    valid: true,\n    errors: [],\n    record: {\n      source_job_id: String(source.source_job_id),\n      source_url: source.source_url,\n      raw_title: source.raw_title,\n      raw_company: source.raw_company,\n      ingested_at: ingestedAt,\n      model: typeof extracted.model === 'string' ? extracted.model : null,\n      extraction_version: EXTRACTION_VERSION,\n\n      normalized_title: input.normalized_title,\n      company: input.company,\n      seniority: input.seniority,\n      tech_stack: input.tech_stack,\n      remote_type: input.remote_type,\n      salary_min: input.salary_min,\n      salary_max: input.salary_max,\n      salary_period: input.salary_period,\n      // Equal by construction on this branch: disagreements route to\n      // dead_letter_log. Both are stored so the rate stays a query.\n      mentions_n8n_model: input.mentions_n8n,\n      mentions_n8n_actual: mentionsN8nActual,\n      ai_ml_role: input.ai_ml_role,\n    },\n  };\n}\n\nif (typeof module !== 'undefined' && module.exports) {\n  module.exports = { validate, EXTRACTION_VERSION, MAX_SALARY_SPAN_RATIO, MAX_TECH_STACK };\n}\n\nconst prep = $('Prep').all();\nconst out = [];\n\nfor (let i = 0; i < $input.all().length; i++) {\n  const result = validate(\n    {\n      source: prep[i].json,\n      extracted: $input.all()[i].json\n    },\n    new Date().toISOString()\n  );\n\n  out.push({\n    json: {\n      ...result.record,\n      __valid: result.valid\n    }\n  });\n}\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1136,
+        0
+      ],
+      "id": "847b8b25-9182-45ea-bc64-9c34704a25e3",
+      "name": "Validator"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "8d8b5447-aa18-416c-b64c-ebeabbe31d0a",
+              "leftValue": true,
+              "rightValue": "={{ $json.__valid }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1312,
+        0
+      ],
+      "id": "bea1277e-5079-4e54-89f6-15f30827d721",
+      "name": "If"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1712,
+        -64
+      ],
+      "id": "7ef5e456-be2b-47dc-99f5-f97d3f8906e6",
+      "name": "jobs_extracted"
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "value": "jobs_extracted",
+          "mode": "list",
+          "cachedResultName": "jobs_extracted"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {
+            "mentions_n8n_model": false,
+            "mentions_n8n_actual": false,
+            "ai_ml_role": false,
+            "salary_min": 0,
+            "salary_max": 0
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "source_job_id",
+              "displayName": "source_job_id",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "source_url",
+              "displayName": "source_url",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "raw_title",
+              "displayName": "raw_title",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "raw_company",
+              "displayName": "raw_company",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "ingested_at",
+              "displayName": "ingested_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "model",
+              "displayName": "model",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "extraction_version",
+              "displayName": "extraction_version",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "normalized_title",
+              "displayName": "normalized_title",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "company",
+              "displayName": "company",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "seniority",
+              "displayName": "seniority",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "tech_stack",
+              "displayName": "tech_stack",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "object",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "remote_type",
+              "displayName": "remote_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "salary_min",
+              "displayName": "salary_min",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "salary_max",
+              "displayName": "salary_max",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "salary_period",
+              "displayName": "salary_period",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "mentions_n8n_model",
+              "displayName": "mentions_n8n_model",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "mentions_n8n_actual",
+              "displayName": "mentions_n8n_actual",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "ai_ml_role",
+              "displayName": "ai_ml_role",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1904,
+        -64
+      ],
+      "id": "da739919-674b-498b-ab86-170be8a813a9",
+      "name": "Insert rows in a table",
+      "credentials": {
+        "postgres": {
+          "id": "rzvvaQ2purAqsDUZ",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f8767dfb-7c34-4940-b098-79f992ebe0a2",
+              "name": "error_codes",
+              "value": "={{ JSON.stringify($json.error_codes) }}",
+              "type": "string"
+            },
+            {
+              "id": "cd2a1c14-8c7d-41f3-bbe5-4ffbdb5476f4",
+              "name": "errors_json",
+              "value": "={{ JSON.stringify($json.errors_json) }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "include": "except",
+        "excludeFields": "description_clean,company,seniority,tech_stack,remote_type,salary_min,salary_max,salary_period,mentions_n8n_model,mentions_n8n_actual,ai_ml_role,normalized_title,__valid",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        1520,
+        112
+      ],
+      "id": "007d9cbf-e72b-4334-b8f3-0b05f7dac619",
+      "name": "Edit Fields1"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "59dce81f-3d86-40f7-962c-941fe683c809",
+              "name": "tech_stack",
+              "value": "={{ JSON.stringify($json.tech_stack) }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "include": "except",
+        "excludeFields": "__valid",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        1536,
+        -64
+      ],
+      "id": "c2c8eb58-fd1d-43c0-894a-36b820e4d49e",
+      "name": "Edit Fields3"
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "value": "dead_letter_log",
+          "mode": "list",
+          "cachedResultName": "dead_letter_log"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {
+            "id": 0
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "source_job_id",
+              "displayName": "source_job_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "source_url",
+              "displayName": "source_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "raw_title",
+              "displayName": "raw_title",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "raw_company",
+              "displayName": "raw_company",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "description",
+              "displayName": "description",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "ingested_at",
+              "displayName": "ingested_at",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "model",
+              "displayName": "model",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "extraction_version",
+              "displayName": "extraction_version",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "error_codes",
+              "displayName": "error_codes",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "object",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "errors_json",
+              "displayName": "errors_json",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "object",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "raw_output",
+              "displayName": "raw_output",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "object",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1904,
+        112
+      ],
+      "id": "1c5a430b-3580-47e8-82cb-635b7a597c06",
+      "name": "Insert rows in a table1",
+      "credentials": {
+        "postgres": {
+          "id": "rzvvaQ2purAqsDUZ",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1712,
+        112
+      ],
+      "id": "e8b42527-6b80-47ce-86d9-62da467ae168",
+      "name": "dead_letter_log"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Split Out",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Out": {
+      "main": [
+        [
+          {
+            "node": "Limit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Limit": {
+      "main": [
+        [
+          {
+            "node": "Prep",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep": {
+      "main": [
+        [
+          {
+            "node": "Claude Extract",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude Extract": {
+      "main": [
+        [
+          {
+            "node": "Validator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validator": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Edit Fields3",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Edit Fields1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "jobs_extracted": {
+      "main": [
+        [
+          {
+            "node": "Insert rows in a table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields1": {
+      "main": [
+        [
+          {
+            "node": "dead_letter_log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields3": {
+      "main": [
+        [
+          {
+            "node": "jobs_extracted",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "dead_letter_log": {
+      "main": [
+        [
+          {
+            "node": "Insert rows in a table1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "420c6521-39d9-4462-a9bb-08afde61a732",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "74859fe694543ef7e2343c4bdeb7cd343f4a3b8aa6b5410dd0ccd446126ba1d3"
+  },
+  "nodeGroups": [],
+  "id": "j7JHGWmaQpa0iaaL",
+  "tags": []
+}
