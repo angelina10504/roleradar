@@ -63,6 +63,7 @@ The `input_schema` of the `extract_job_fields` tool, and how it lands in
 | `remote_type` | enum | `remote` \| `hybrid` \| `onsite` \| `unspecified` |
 | `salary_min` | number \| null | |
 | `salary_max` | number \| null | |
+| `salary_period` | enum | `hourly` \| `monthly` \| `yearly` \| `unspecified` |
 | `mentions_n8n` | boolean | the model's claim. Stored as `mentions_n8n_model`. See (c) |
 | `mentions_n8n_actual` | boolean | **not in the tool schema.** Computed by the validator. See (c) |
 | `ai_ml_role` | boolean | |
@@ -98,15 +99,41 @@ Partitioning bounds the scan for time-range charts; clustering makes the
 ### (b) Provenance columns and the validator contract
 
 `jobs_extracted` carries the extracted fields plus provenance. Note that the
-nine schema fields become ten columns, because `mentions_n8n` splits into
+ten schema fields become eleven columns, because `mentions_n8n` splits into
 `mentions_n8n_model` and `mentions_n8n_actual` per decision (c). Provenance:
-`source_job_id`, `source_url`, `raw_title`, `raw_company`, `ingested_at`,
-`model`, `extraction_version`.
+
+| column | source | notes |
+|---|---|---|
+| `source_job_id` | Remotive | type unresolved. See below. |
+| `source_url` | Remotive | |
+| `raw_title` | Remotive | |
+| `raw_company` | Remotive | |
+| `publication_date` | Remotive | when the posting went up, distinct from `ingested_at` |
+| `ingested_at` | argument to `validate()` | when this pipeline saw it |
+| `model` | Anthropic response | |
+| `extraction_version` | constant in `validate.js` | |
 
 **Why:** without these, a row cannot be traced back to the posting it came from,
 and a dead-letter row is an error message attached to nothing. `model` and
 `extraction_version` mean rows stay comparable after the prompt or tool schema
-changes.
+changes. `extraction_version` currently has two conflicting definitions:
+`validate.js` hardcodes `'1.0.0'` and `.env.example` documents
+`EXTRACTION_VERSION=v1`, which is not wired to anything. Reconcile before
+writing rows anywhere permanent.
+
+**`publication_date` is not yet emitted by the validator.** It is in the
+Remotive records and in `validator/fixtures/source-records.json`, and it belongs
+here because first-posted and first-seen are different dates and the
+postings-over-time chart needs to distinguish them. `validate.js` does not put
+it on either record yet, and `validate.test.js` asserts the exact record shape,
+so adding it is a code change plus a test change. Open item.
+
+**`source_job_id` type is unresolved.** Remotive returns it as a number.
+`validate.js` coerces it to a string on the record, so the column type does not
+depend on what the API feels like sending, and so the `PARTITION BY
+source_job_id` window in the view stays stable across a format change upstream.
+The BigQuery DDL is not written yet. When it is, it has to agree with that
+coercion — STRING, not INT64 — or the insert fails.
 
 The full job description is **not** written to `jobs_extracted`. Descriptions are
 long HTML and would dominate the table's storage for no query benefit. It is
