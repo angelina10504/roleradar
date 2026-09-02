@@ -14,7 +14,10 @@ branching to jobs_extracted and dead_letter_log.](docs/pipeline.png)
 
 The workflow runs end to end. One scheduled run:
 
-1. **Schedule Trigger** fires the run.
+1. **Schedule Trigger** fires the run. It runs daily, unattended. Verified
+   before the interval was widened: two consecutive scheduled executions ran on
+   their own at 15-minute intervals, with nobody pressing anything. The workflow
+   is published, so the schedule is live.
 2. **HTTP Request** does `GET https://remotive.com/api/remote-jobs?search=<term>`
    and returns one item containing the whole result set.
 3. **Split Out** turns the `jobs` array into one item per posting.
@@ -37,27 +40,79 @@ has never been exercised is not evidence of anything.
 As of the last check:
 
 ```
-jobs_extracted    8 rows  -- 4 postings x 2 runs
-jobs_latest       4 rows  -- one per posting, newest run only
+jobs_extracted   16 rows  -- every observation, across every run
+jobs_latest       7 rows  -- one per distinct posting, newest sighting only
 dead_letter_log   3 rows  -- all source_job_id 2091105
 ```
 
-The contrast between the first two numbers is the append-only design working.
-Two runs saw the same four postings. `jobs_extracted` kept all eight sightings,
-timestamped `14:36:47.951` and `15:02:44.752`. `jobs_latest` collapses them to
-the four current rows, all from the later run, by ranking within each
-`source_job_id` on `ingested_at` and keeping rank 1.
+The gap between the first two numbers is the point. `jobs_extracted` is an
+immutable log of every observation: 16 sightings. `jobs_latest` resolves current
+state by ranking within each `source_job_id` on `ingested_at` and keeping rank 1:
+7 distinct postings.
 
-Nothing was overwritten to get there. Run one's rows are still in the table, so
-first-seen date and re-listing history are both recoverable. The
+7, not 4. Remotive's feed moves between runs, and the Limit node caps the item
+count at 5 after Split Out, so different runs pick up different postings. The
+distinct-posting count grows as the feed turns over, independently of how many
+items any single run processes.
+
+Nothing was overwritten to get there. Every earlier run's rows are still in the
+table, so first-seen date and re-listing history are both recoverable. The
 postings-over-time chart needs exactly that, and an upsert would have destroyed
-it. Deriving current state on read costs a window function over eight rows.
+it. Deriving current state on read costs a window function over 16 rows.
 
 An earlier version had a primary key on `source_job_id`, which made the table
 upsert-shaped: the second run's inserts were rejected and `jobs_latest` was a
 no-op, since `ROW_NUMBER()` over a unique column is always 1. That key has been
 replaced with a `BIGSERIAL` on `id`, plus an index on
 `(source_job_id, ingested_at DESC)` matching the window's key order.
+
+### The lifecycle query
+
+This is the query the append-only table exists to make answerable, and its real
+output:
+
+```sql
+SELECT source_job_id,
+       COUNT(*)          AS times_seen,
+       MIN(ingested_at)  AS first_seen,
+       MAX(ingested_at)  AS last_seen
+FROM jobs_extracted
+GROUP BY source_job_id
+ORDER BY times_seen DESC;
+```
+
+```
+ source_job_id | times_seen |       first_seen        |        last_seen
+---------------+------------+-------------------------+-------------------------
+ 2091098       |          4 | 2026-08-23 14:36:47.951 | 2026-09-02 15:00:37.808
+ 2091100       |          2 | 2026-09-02 14:45:35.098 | 2026-09-02 15:00:37.806
+ 2091101       |          2 | 2026-09-02 14:45:35.093 | 2026-09-02 15:00:37.805
+ 1919266       |          2 | 2026-08-23 14:36:47.951 | 2026-08-23 15:02:44.752
+ 2091099       |          2 | 2026-09-02 14:45:35.098 | 2026-09-02 15:00:37.806
+ 2091104       |          2 | 2026-08-23 14:36:47.951 | 2026-08-23 15:02:44.752
+ 2091097       |          2 | 2026-08-23 14:36:47.951 | 2026-08-23 15:02:44.752
+```
+
+Three lifecycle states, from one query over one table:
+
+- **Still open.** 2091098 was first seen on Aug 23 and was still in the feed on
+  Sep 2. Ten days open.
+- **New.** 2091099, 2091100 and 2091101 have a first_seen of Sep 2. They entered
+  the feed between the two dates.
+- **Gone.** 1919266, 2091097 and 2091104 were last seen on Aug 23 and have not
+  appeared since. They dropped out of the feed.
+
+A MERGE-shaped table would report 7 rows too. It would not report any of this.
+Each posting would carry one timestamp, overwritten on every sighting, so
+first-seen date and re-listing history would both have been discarded on the
+second run.
+
+**One honest caveat.** The pipeline sat idle between Aug 23 and Sep 2, so
+`times_seen` is a count of runs that saw the posting, not a measure of how
+continuously the posting was listed. 2091098's 4 is four observations across two
+clusters of runs ten days apart, not four days of presence. `first_seen` and
+`last_seen` are real: those are the timestamps of actual observations. Anything
+derived from the count between them is not.
 
 All three dead-letter rows are the same TELUS Digital listing, whose salary the
 model has repeatedly got wrong. In the captured fixtures it returned
@@ -83,9 +138,9 @@ in the existing compose file was the smallest change that kept the pipeline
 running end to end, and it costs nothing.
 
 What this loses: partitioning on `DATE(ingested_at)` and clustering on
-`source_job_id`, both of which were part of the append-only design. At four
-rows, neither matters. At a scale where they would, Postgres wants an index
-rather than a partition, and none is created yet.
+`source_job_id`, both of which were part of the append-only design. At 16 rows,
+neither matters. At a scale where they would, Postgres wants an index rather
+than a partition, and none is created yet.
 
 What it does not change: the append-only model, the dedupe-on-read view, the
 split between the two tables, and the validator contract. Those were warehouse
@@ -271,6 +326,13 @@ schema, column for column and index for index, but that is a fact about today,
 verified by hand, not a guarantee. A migration tool would close the gap, and
 would also give the primary-key change above a recorded, replayable history
 instead of an `ALTER TABLE` someone ran once.
+
+**The schedule only runs while the container does.** n8n holds the cron
+in-process, so a daily trigger fires only if `docker compose up` is still
+running at the time. Uptime is the laptop's uptime. Close the lid overnight and
+that day's run does not happen and is not retried — there is no catch-up on
+start. This is a consequence of self-hosting, not a bug, but it means gaps in
+`jobs_extracted` are gaps in observation, not evidence about the feed.
 
 **`validate.js` is hand-pasted into the n8n Code node.** The file in this repo
 is the source of truth for the logic. The copy running in the canvas is a
