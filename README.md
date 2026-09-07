@@ -524,6 +524,84 @@ To serve the page from nginx instead, copy that one file to the static root and
 set `API_BASE` at the top of its script block to wherever the API is. CORS is
 open on the API for exactly this case.
 
+### Pooled connections do not carry a search_path
+
+Every query in `api/main.py` and `sql/queries.sql` writes
+`public.jobs_extracted`, not `jobs_extracted`. That is not stylistic.
+
+The warehouse moved to Neon, and the API connects through Neon's **pooled**
+endpoint, which is PgBouncer in transaction mode. Restoring the `pg_dump` set
+`search_path` to `''` for the duration of that session — standard `pg_dump`
+behaviour, and harmless on a direct connection. The pooler then handed the same
+backend to the next client with that setting still on it. Every unqualified
+query started failing with `relation "jobs_extracted" does not exist`, while the
+identical query on the direct endpoint worked.
+
+`ALTER ROLE ... SET search_path` and `ALTER DATABASE ... SET search_path` both
+applied and neither fixed it, because they take effect for new backends and the
+pooler was reusing an existing one.
+
+**The lesson is that session state is not yours on a pooled connection.**
+Anything a client sets — `search_path`, `SET TIME ZONE`, prepared statements,
+`SET ROLE` — can outlive that client and reach the next one, and can equally be
+absent when you assume it. A transaction pooler guarantees you a transaction,
+not a session. So the fix is not to set the search path more forcefully; it is
+to write queries that do not depend on one.
+
+Schema-qualifying is the durable form of that. It costs seven characters per
+reference and removes a whole class of failure that only appears under load,
+only in the deployed environment, and looks like the table has vanished.
+
+## Deployment
+
+**Live dashboard:** https://roleradar-snowy.vercel.app
+
+Reads the hosted Neon warehouse. Always reachable. The first load after a quiet
+period is slow because Neon suspends the compute when idle — the page says
+"waking the database" rather than showing a spinner or reporting a failure.
+
+### What is hosted and what is not
+
+Two of the three pieces run in the cloud. The third does not, and the
+distinction matters for reading the dashboard.
+
+| piece | where it runs | up when |
+|---|---|---|
+| Dashboard page + metrics API | Vercel | always |
+| Warehouse (Postgres 16 → Neon 18) | Neon | always, though the compute suspends when idle |
+| **n8n pipeline** | **Docker on a laptop** | **only while that laptop is on** |
+
+**The pipeline is not deployed.** n8n still runs in Docker locally and holds its
+cron in-process. Ingestion happens when that machine is up and the container is
+running, and not otherwise — there is no catch-up on start, so a day the laptop
+was closed is a day with no run. The hosted half is the *reading* half.
+
+The practical consequence: the live dashboard is always reachable and its
+numbers are always real, but "time since last run that produced data" measures
+laptop uptime as much as pipeline health. A stale value there usually means the
+machine was off, not that anything broke. Do not read the deployed URL as
+evidence of a continuously running pipeline, because it is not one.
+
+Deploying n8n properly would mean hosting it somewhere always-on, which is a
+paid tier on every provider worth using, and the ingestion cost is per-run
+Anthropic spend. Neither is justified for a portfolio project on free tiers.
+
+### Configuration
+
+The API takes `DATABASE_URL` and it overrides every `POSTGRES_*` value. On
+Vercel it is set as an environment variable and is never in the repo, never in
+the HTML, and never in a commit. Locally the same string lives in `.env` as
+`NEON_DATABASE_URL`, which is gitignored.
+
+Use Neon's **pooled** connection string — the host contains `-pooler`. See
+"Pooled connections do not carry a search_path" above for what that implies for
+the SQL.
+
+`api/static/index.html` reads from the API only. It contains no credentials and
+holds nothing but an `API_BASE` constant, empty by default, meaning same origin.
+Copying that one file to an nginx static root and setting `API_BASE` to the
+Vercel URL is still a supported way to serve it.
+
 ## Known limitations
 
 These are real weaknesses, not details.
@@ -610,6 +688,15 @@ behave until they agree.
 `validate.js` hardcodes `'1.0.0'`, which is what reaches the rows.
 `.env.example` documents `EXTRACTION_VERSION=v1`, which is not wired to
 anything.
+
+**The API has open CORS and no rate limiting.** `allow_origins=["*"]`, so any
+site can call it from a browser, and there is nothing throttling requests. It
+was set that way so the single HTML file works when nginx serves it from a
+different origin than the API. Every endpoint is read-only aggregate counts over
+public job postings and there are no credentials to steal, so the exposure is
+cost rather than data: a deployed URL can be called in a loop by anyone who
+finds it, which burns Vercel invocations and wakes the Neon compute. Real
+mitigations would be an origin allowlist and a rate limit; neither is present.
 
 **The dashboard SQL is duplicated into `api/main.py`.** `sql/queries.sql` is
 the readable source of truth, with the reasoning in its comments. `main.py`

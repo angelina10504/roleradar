@@ -123,6 +123,7 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-muted); flex: none; }
   .dot.up { background: var(--good); }
   .dot.down { background: var(--critical); }
+  .dot.waking { background: var(--warning); }
 
   /* --- summary strip ------------------------------------------------- */
   .strip { display: grid; gap: 14px; margin: 22px 0 18px;
@@ -166,6 +167,16 @@
   .state.show { display: block; }
   .state.err { border-style: solid; border-color: var(--critical);
                color: var(--critical); text-align: left; }
+  /* Waiting is not failing. A slow first request gets its own neutral state
+     with an explanation, never a bare spinner and never the error styling. */
+  .state.loading, .state.waking { border-color: var(--grid); color: var(--ink-muted); }
+  .state.waking { color: var(--ink-2); }
+  .state.waking .puls { display: inline-block; width: 7px; height: 7px;
+                        border-radius: 50%; background: var(--series-4);
+                        margin-right: 8px; vertical-align: 0px;
+                        animation: puls 1.1s ease-in-out infinite; }
+  @keyframes puls { 0%,100% { opacity: .25 } 50% { opacity: 1 } }
+  @media (prefers-reduced-motion: reduce) { .state.waking .puls { animation: none } }
   .state .hint { display: block; color: var(--ink-muted); font-size: 12px;
                  margin-top: 6px; }
   .state code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -420,18 +431,23 @@ const esc = s => String(s).replace(/[&<>"]/g,
  * look identical on an empty chart and mean opposite things, so
  * neither is ever drawn as a chart of zeros.
  * ------------------------------------------------------------------ */
+const KIND_CLASS = { error: " err", loading: " loading", waking: " waking" };
+
 function setState(panelId, kind, message, hint) {
   const el = document.getElementById("s-" + panelId);
   const plot = el.previousElementSibling;
-  el.className = "state show" + (kind === "error" ? " err" : "");
+  el.dataset.kind = kind;
+  el.className = "state show" + (KIND_CLASS[kind] || "");
+  const dot = kind === "waking" ? '<span class="puls"></span>' : "";
   el.innerHTML = kind === "error"
     ? `<b>Could not load this panel.</b><span class="hint">${esc(message)}</span>`
-    : `${esc(message)}${hint ? `<span class="hint">${esc(hint)}</span>` : ""}`;
+    : `${dot}${esc(message)}${hint ? `<span class="hint">${esc(hint)}</span>` : ""}`;
   if (plot && plot.classList.contains("plot")) plot.classList.add("hidden");
 }
 
 function clearState(panelId) {
   const el = document.getElementById("s-" + panelId);
+  el.dataset.kind = "";
   el.className = "state";
   el.innerHTML = "";
   const plot = el.previousElementSibling;
@@ -439,10 +455,59 @@ function clearState(panelId) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Waiting states.
+ *
+ * Neon suspends the compute when the warehouse is idle, so the first
+ * request after a pause is slow, not broken. Three things follow from
+ * that: a slow request says it is waiting, a wait that looks like a
+ * cold start says so by name, and the API's own timeout is retried
+ * once rather than reported as "down". A suspended database and a
+ * dead one are different facts and the page has to tell them apart.
+ * ------------------------------------------------------------------ */
+const PANELS = ["volume", "rate", "errors", "model", "runs"];
+const WAKE_AFTER_MS = 1400;
+const WAKING_MSG = "Waking the database\u2026";
+const WAKING_HINT =
+  "Neon suspends the compute when idle. The first request after a pause takes a few seconds.";
+
+let wakeTimer = null;
+
+function beginLoading() {
+  PANELS.forEach(p => setState(p, "loading", "Loading\u2026"));
+  setStripNote("loading\u2026");
+  clearTimeout(wakeTimer);
+  /* Only panels still waiting get upgraded to "waking" -- anything that
+     already resolved keeps its result. */
+  wakeTimer = setTimeout(() => {
+    PANELS.forEach(p => {
+      const el = document.getElementById("s-" + p);
+      if (el && el.dataset.kind === "loading") setState(p, "waking", WAKING_MSG, WAKING_HINT);
+    });
+    if (stripPending) setStripNote(WAKING_MSG);
+  }, WAKE_AFTER_MS);
+}
+
+function endLoading() { clearTimeout(wakeTimer); }
+
+/* True while /api/summary is still outstanding, so the wake timer knows
+   whether the strip is waiting or already answered. */
+let stripPending = false;
+
+function setStripNote(text, warn) {
+  ["t-total-n", "t-rate-n", "t-rej-n", "t-since-n"].forEach(id => {
+    const el = document.getElementById(id);
+    el.textContent = text;
+    el.classList.toggle("warnish", !!warn);
+  });
+}
+
+const isColdStart = msg => /waking from suspend|no database connection within/i.test(msg);
+
+/* ------------------------------------------------------------------ *
  * Fetch. A non-2xx carries the API's own detail through to the panel
  * rather than collapsing to "failed".
  * ------------------------------------------------------------------ */
-async function getJSON(path) {
+async function getJSON(path, retried) {
   let res;
   try {
     res = await fetch(API_BASE + path, { headers: { Accept: "application/json" } });
@@ -453,6 +518,13 @@ async function getJSON(path) {
   try { body = await res.json(); } catch (e) { /* fall through to status */ }
   if (!res.ok) {
     const detail = body && (body.detail || body.error) ? (body.detail || body.error) : res.statusText;
+    /* A cold-start timeout is worth exactly one retry: by the time the first
+       attempt times out, the compute is usually already awake. Retrying twice
+       would just be a slow way to report the same failure. */
+    if (!retried && isColdStart(detail)) {
+      await new Promise(r => setTimeout(r, 2500));
+      return getJSON(path, true);
+    }
     throw new Error(`${path} returned ${res.status} — ${detail}`);
   }
   return body;
@@ -812,8 +884,9 @@ async function loadHealth() {
     txt.textContent = "warehouse reachable";
     pill.title = "checked " + h.checked_at + "Z";
   } catch (e) {
-    dot.className = "dot down";
-    txt.textContent = "warehouse unreachable";
+    const cold = isColdStart(e.message);
+    dot.className = "dot " + (cold ? "waking" : "down");
+    txt.textContent = cold ? "warehouse waking" : "warehouse unreachable";
     pill.title = e.message;
   }
 }
@@ -836,22 +909,24 @@ async function loadRuns(limit) {
     renderVolume(); renderRate(); renderRunsTable();
   } catch (e) {
     ["volume", "rate", "runs"].forEach(p => setState(p, "error", e.message));
+    if (isColdStart(e.message)) ["volume", "rate", "runs"].forEach(p =>
+      setState(p, "error", e.message + " — the database did not wake in time. Refresh to retry."));
     destroy("volume"); destroy("rate");
     document.getElementById("runs-table-wrap").innerHTML = "";
   }
 }
 
 async function loadSummary() {
+  stripPending = true;
   try {
-    renderSummary(await getJSON("/api/summary"));
+    const d = await getJSON("/api/summary");
+    stripPending = false;
+    renderSummary(d);
   } catch (e) {
+    stripPending = false;
     ["t-total", "t-rate", "t-rej", "t-since"]
       .forEach(id => { document.getElementById(id).textContent = "—"; });
-    ["t-total-n", "t-rate-n", "t-rej-n", "t-since-n"].forEach(id => {
-      const el = document.getElementById(id);
-      el.textContent = "summary unavailable";
-      el.classList.add("warnish");
-    });
+    setStripNote(isColdStart(e.message) ? "database did not wake" : "summary unavailable", true);
     document.getElementById("t-total-n").title = e.message;
   }
 }
@@ -895,18 +970,27 @@ async function loadModel() {
   }
 }
 
-async function loadAll() {
+async function loadAll(isRefresh) {
   const limit = document.getElementById("limit").value;
-  /* Hold the previous render at reduced opacity rather than flashing a
-     skeleton, so nothing jumps on refresh. */
-  document.querySelectorAll(".card, .strip").forEach(el => el.classList.add("stale"));
-  await Promise.all([loadHealth(), loadRuns(limit), loadSummary(), loadErrors(), loadModel()]);
-  document.querySelectorAll(".card, .strip").forEach(el => el.classList.remove("stale"));
+  /* On a refresh, hold the previous render at reduced opacity rather than
+     flashing a skeleton, so nothing jumps. On first paint there is nothing to
+     hold, so the panels say they are loading instead of sitting blank. */
+  if (isRefresh) {
+    document.querySelectorAll(".card, .strip").forEach(el => el.classList.add("stale"));
+  } else {
+    beginLoading();
+  }
+  try {
+    await Promise.all([loadHealth(), loadRuns(limit), loadSummary(), loadErrors(), loadModel()]);
+  } finally {
+    endLoading();
+    document.querySelectorAll(".card, .strip").forEach(el => el.classList.remove("stale"));
+  }
 }
 
 /* --- wiring -------------------------------------------------------- */
-document.getElementById("refresh").addEventListener("click", loadAll);
-document.getElementById("limit").addEventListener("change", loadAll);
+document.getElementById("refresh").addEventListener("click", () => loadAll(true));
+document.getElementById("limit").addEventListener("change", () => loadAll(true));
 
 document.querySelectorAll("[data-vol]").forEach(b => {
   b.addEventListener("click", () => {

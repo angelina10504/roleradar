@@ -1,0 +1,14 @@
+# Nothing here needs to reach Vercel except the API and the one HTML file.
+.git
+.env
+.env.example
+api/.venv
+validator
+workflows
+docs
+sql
+n8n_data
+docker-compose.yml
+CLAUDE.md
+README.md
+.sf

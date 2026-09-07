@@ -68,10 +68,10 @@
 
 WITH events AS (
     SELECT ingested_at                      AS ts, 1 AS validated, 0 AS rejected
-    FROM jobs_extracted
+    FROM public.jobs_extracted
     UNION ALL
     SELECT ingested_at AT TIME ZONE 'UTC'   AS ts, 0 AS validated, 1 AS rejected
-    FROM dead_letter_log
+    FROM public.dead_letter_log
 ),
 marked AS (
     SELECT
@@ -190,10 +190,10 @@ ORDER BY run_started_at;
 
 WITH events AS (
     SELECT ingested_at                      AS ts, 1 AS validated, 0 AS rejected
-    FROM jobs_extracted
+    FROM public.jobs_extracted
     UNION ALL
     SELECT ingested_at AT TIME ZONE 'UTC'   AS ts, 0 AS validated, 1 AS rejected
-    FROM dead_letter_log
+    FROM public.dead_letter_log
 ),
 marked AS (
     SELECT
@@ -302,7 +302,7 @@ WITH exploded AS (
         d.id                AS dead_letter_id,
         e ->> 'field'       AS field,
         e ->> 'code'        AS code
-    FROM dead_letter_log d
+    FROM public.dead_letter_log d
     CROSS JOIN LATERAL jsonb_array_elements(
         CASE
             WHEN jsonb_typeof(d.errors_json) = 'string'
@@ -329,7 +329,7 @@ classified AS (
     FROM exploded
 ),
 totals AS (
-    SELECT COUNT(*) AS total_rejected_rows FROM dead_letter_log
+    SELECT COUNT(*) AS total_rejected_rows FROM public.dead_letter_log
 )
 SELECT
     c.code,
@@ -379,13 +379,13 @@ WITH processed AS (
         model,
         extraction_version,
         false AS mismatch
-    FROM jobs_extracted
+    FROM public.jobs_extracted
     UNION ALL
     SELECT
         model,
         extraction_version,
         error_codes @> '["N8N_MISMATCH"]'::jsonb AS mismatch
-    FROM dead_letter_log
+    FROM public.dead_letter_log
 )
 SELECT
     COALESCE(model, '(unrecorded)')              AS model,
@@ -408,12 +408,12 @@ WITH events AS (
     SELECT
         ingested_at AS ts,
         false       AS mismatch
-    FROM jobs_extracted
+    FROM public.jobs_extracted
     UNION ALL
     SELECT
         ingested_at AT TIME ZONE 'UTC'            AS ts,
         error_codes @> '["N8N_MISMATCH"]'::jsonb  AS mismatch
-    FROM dead_letter_log
+    FROM public.dead_letter_log
 ),
 marked AS (
     SELECT
@@ -476,13 +476,13 @@ WITH events AS (
         'jobs_extracted'::text AS src,
         ingested_at            AS ts_normalised,
         ingested_at::text      AS ts_raw
-    FROM jobs_extracted
+    FROM public.jobs_extracted
     UNION ALL
     SELECT
         'dead_letter_log'::text,
         ingested_at AT TIME ZONE 'UTC',
         ingested_at::text
-    FROM dead_letter_log
+    FROM public.dead_letter_log
 ),
 marked AS (
     SELECT

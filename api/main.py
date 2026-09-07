@@ -19,7 +19,7 @@ No credentials in this file. Connection details come from the environment.
 from __future__ import annotations
 
 import os
-from contextlib import asynccontextmanager
+import threading
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -43,10 +43,13 @@ STATIC_DIR = Path(__file__).parent / "static"
 RUN_GAP_MINUTES = int(os.environ.get("RUN_GAP_MINUTES", "2"))
 RUN_GAP = f"{RUN_GAP_MINUTES} minutes"
 
-# Seconds to wait for a connection before giving up and returning 503. Short on
-# purpose: a dashboard that hangs is worse than one that says the database is
-# down.
-DB_TIMEOUT = float(os.environ.get("DB_TIMEOUT_SECONDS", "3"))
+# Seconds to wait for a connection before giving up and returning 503.
+#
+# 8s, not 3s. Neon's free tier suspends the compute when idle and takes several
+# seconds to wake, so a short timeout reports "database down" for a database
+# that is merely asleep -- a false alarm is worse than a slow first paint. Still
+# bounded, because a dashboard that hangs forever is worse than both.
+DB_TIMEOUT = float(os.environ.get("DB_TIMEOUT_SECONDS", "8"))
 
 
 def connection_string() -> str:
@@ -84,10 +87,10 @@ def connection_string() -> str:
 _RUNS_PREAMBLE = """
 WITH events AS (
     SELECT ingested_at                    AS ts, 1 AS validated, 0 AS rejected
-    FROM jobs_extracted
+    FROM public.jobs_extracted
     UNION ALL
     SELECT ingested_at AT TIME ZONE 'UTC' AS ts, 0 AS validated, 1 AS rejected
-    FROM dead_letter_log
+    FROM public.dead_letter_log
 ),
 marked AS (
     SELECT
@@ -232,7 +235,7 @@ WITH exploded AS (
         d.id          AS dead_letter_id,
         e ->> 'field' AS field,
         e ->> 'code'  AS code
-    FROM dead_letter_log d
+    FROM public.dead_letter_log d
     CROSS JOIN LATERAL jsonb_array_elements(
         CASE
             WHEN jsonb_typeof(d.errors_json) = 'string'
@@ -259,7 +262,7 @@ classified AS (
     FROM exploded
 ),
 totals AS (
-    SELECT COUNT(*) AS total_rejected_rows FROM dead_letter_log
+    SELECT COUNT(*) AS total_rejected_rows FROM public.dead_letter_log
 )
 SELECT
     c.code,
@@ -283,11 +286,11 @@ ORDER BY rows DESC, occurrences DESC, c.code
 SQL_MODEL_ACCURACY_BY_VERSION = """
 WITH processed AS (
     SELECT model, extraction_version, false AS mismatch
-    FROM jobs_extracted
+    FROM public.jobs_extracted
     UNION ALL
     SELECT model, extraction_version,
            error_codes @> '["N8N_MISMATCH"]'::jsonb AS mismatch
-    FROM dead_letter_log
+    FROM public.dead_letter_log
 )
 SELECT
     COALESCE(model, '(unrecorded)')              AS model,
@@ -306,11 +309,11 @@ ORDER BY 1, 2
 SQL_MODEL_ACCURACY_BY_RUN = """
 WITH events AS (
     SELECT ingested_at AS ts, false AS mismatch
-    FROM jobs_extracted
+    FROM public.jobs_extracted
     UNION ALL
     SELECT ingested_at AT TIME ZONE 'UTC' AS ts,
            error_codes @> '["N8N_MISMATCH"]'::jsonb AS mismatch
-    FROM dead_letter_log
+    FROM public.dead_letter_log
 ),
 marked AS (
     SELECT
@@ -344,30 +347,36 @@ ORDER BY run_started_at
 # Database access
 # --------------------------------------------------------------------------
 
-pool: ConnectionPool | None = None
+_pool: ConnectionPool | None = None
+_pool_lock = threading.Lock()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Open the pool without blocking on the database being up.
+def get_pool() -> ConnectionPool:
+    """Create the pool on first use, not at import and not in a lifespan hook.
 
-    open=False plus a manual open(wait=False) means uvicorn starts even when
-    Postgres is down. That is deliberate: the point of /api/health is to report
-    that state, which it cannot do if the app refused to boot.
+    This started as a FastAPI lifespan handler, which is the idiomatic place for
+    it and works under uvicorn. It does not survive the move to Vercel: the
+    serverless Python runtime does not reliably run ASGI lifespan events, so the
+    pool stayed None and every request died on an assertion. Lazy
+    initialisation behaves identically under uvicorn and is correct under a
+    runtime that never sends a startup event.
+
+    min_size=0 because a suspended Neon compute should not be held awake by an
+    idle dashboard, and because each serverless instance would otherwise open a
+    connection it may never use.
     """
-    global pool
-    pool = ConnectionPool(
-        conninfo=connection_string(),
-        min_size=1,
-        max_size=4,
-        open=False,
-        kwargs={"row_factory": dict_row},
-    )
-    pool.open(wait=False)
-    try:
-        yield
-    finally:
-        pool.close()
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                _pool = ConnectionPool(
+                    conninfo=connection_string(),
+                    min_size=0,
+                    max_size=int(os.environ.get("DB_POOL_MAX", "2")),
+                    open=True,
+                    kwargs={"row_factory": dict_row},
+                )
+    return _pool
 
 
 class DatabaseUnavailable(Exception):
@@ -381,15 +390,15 @@ def run_query(sql: str, params: dict[str, Any] | None = None) -> list[dict]:
     single thing to catch and can answer 503 with the real message instead of a
     500 with a stack trace.
     """
-    assert pool is not None
     try:
-        with pool.connection(timeout=DB_TIMEOUT) as conn:
+        with get_pool().connection(timeout=DB_TIMEOUT) as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, params or {})
                 return [_jsonable(row) for row in cur.fetchall()]
     except PoolTimeout as exc:
         raise DatabaseUnavailable(
-            f"no database connection within {DB_TIMEOUT:g}s: {exc}"
+            f"no database connection within {DB_TIMEOUT:g}s "
+            f"(the database may be waking from suspend): {exc}"
         ) from exc
     except psycopg.Error as exc:
         raise DatabaseUnavailable(str(exc).strip()) from exc
@@ -445,7 +454,6 @@ app = FastAPI(
         "endpoint; the queries and their reasoning are in sql/queries.sql."
     ),
     version="1.0.0",
-    lifespan=lifespan,
 )
 
 # Open CORS. The dashboard is one static file designed to be dropped on an
