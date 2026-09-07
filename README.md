@@ -512,6 +512,24 @@ cross-check when that field passed its own boolean type check, so a row that
 failed schema validation and would also have disagreed does not always carry the
 code. It undercounts and never overcounts.
 
+**The observed rate is 0, across all 26 records.** Not a single dead-letter row
+carries `N8N_MISMATCH`, and every one of the 20 rows in `jobs_extracted` has
+`mentions_n8n_model = false` and `mentions_n8n_actual = false`. No posting
+processed so far contains the token, so every comparison the cross-check has
+ever made has been false against false.
+
+That is a weak result and worth stating as one. A metric that has only ever
+agreed is not evidence that it would catch a disagreement — it is evidence that
+the sample has never contained one. The mechanism is exercised by the test
+suite, which asserts both the matching and mismatching branches against real
+captured fixtures; the live sample has not produced a positive case.
+
+Fixing this needs data, not code: either a search term that actually returns
+postings mentioning n8n, or a deliberately wrong `mentions_n8n` fed through the
+validator, on the same argument as the deliberate dead-letter row. Until then
+the panel is a chart of five zeroes, and reading it as "the model is accurate"
+would be reading it wrong.
+
 ### What the dashboard cannot see
 
 A run that died before either Postgres node wrote anything leaves no rows in
@@ -541,14 +559,14 @@ A `runs[]` entry:
 
 ```json
 {
-  "run_started_at": "2026-09-05T03:00:01.412000",
-  "run_ended_at":   "2026-09-05T03:00:01.907000",
+  "run_started_at": "2026-09-03T15:03:56.860000",
+  "run_ended_at":   "2026-09-03T15:03:56.865000",
   "ingested": 5, "validated": 4, "rejected": 1,
   "success_rate": 0.8,
-  "success_rate_delta": -0.2,
-  "success_rate_rolling3": 0.8667,
-  "cumulative_ingested": 16,
-  "cumulative_validated": 13,
+  "success_rate_delta": 0.0,
+  "success_rate_rolling3": 0.8,
+  "cumulative_ingested": 26,
+  "cumulative_validated": 20,
   "status": "degraded"
 }
 ```
@@ -560,8 +578,8 @@ on the oldest visible run still refers to the run before it.
 A `classes[]` entry:
 
 ```json
-{ "code": "N8N_MISMATCH", "category": "model_disagreement",
-  "rows": 2, "occurrences": 2, "pct_of_rejected_rows": 0.6667 }
+{ "code": "SALARY_PARTIAL", "category": "salary_logic",
+  "rows": 5, "occurrences": 5, "pct_of_rejected_rows": 0.8333 }
 ```
 
 ### Failure states
@@ -592,34 +610,6 @@ fail immediately and produce a real error worth showing; only a probe that also
 times out is genuinely ambiguous, and that is the sole case reported as "may be
 waking". The screenshot above is the refused case, which is why it reads
 unreachable rather than waking.
-
-### Running it
-
-The API reads connection details from the environment and has no credentials in
-the file. `.env` currently sets only `POSTGRES_PASSWORD`; the rest fall back to
-the values in `docker-compose.yml`.
-
-```
-POSTGRES_HOST=localhost   POSTGRES_PORT=5432
-POSTGRES_DB=roleradar     POSTGRES_USER=roleradar
-POSTGRES_PASSWORD=...     API_PORT=8000
-```
-
-`DATABASE_URL` overrides all of them if set.
-
-```sh
-docker compose up -d
-python -m venv api/.venv && source api/.venv/bin/activate
-pip install -r api/requirements.txt
-set -a && source .env && set +a
-uvicorn main:app --app-dir api --port 8000
-```
-
-Then open `http://localhost:8000/`, which serves `api/static/index.html`.
-
-To serve the page from nginx instead, copy that one file to the static root and
-set `API_BASE` at the top of its script block to wherever the API is. CORS is
-open on the API for exactly this case.
 
 ### Pooled connections do not carry a search_path
 
