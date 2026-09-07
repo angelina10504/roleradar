@@ -30,3 +30,4 @@ n8n_data/
 .vercel
 .env*
 !.env.example
+.sf/

@@ -10,6 +10,12 @@ It tracks postings that mention n8n, and it is built with n8n.
 Remotive, Split Out, Limit, Prep, Claude Extract, Validator, and an IF node
 branching to jobs_extracted and dead_letter_log.](docs/pipeline.png)
 
+**Live dashboard: https://roleradar-snowy.vercel.app**
+
+The dashboard and the warehouse are hosted. The pipeline above is not — n8n runs
+in Docker on a laptop, so ingestion happens only while that machine is up. The
+live URL is not evidence of continuous operation. See [Deployment](#deployment).
+
 ## What it does
 
 The workflow runs end to end. One scheduled run:
@@ -40,13 +46,16 @@ has never been exercised is not evidence of anything.
 As of the last check:
 
 ```
-jobs_extracted   16 rows  -- every observation, across every run
+jobs_extracted   20 rows  -- every observation, across every run
 jobs_latest       7 rows  -- one per distinct posting, newest sighting only
-dead_letter_log   3 rows  -- all source_job_id 2091105
+dead_letter_log   6 rows  -- all source_job_id 2091105
 ```
 
+Counted on Neon, which is the live warehouse. The local Docker container holds
+an identical copy as the pre-migration snapshot.
+
 The gap between the first two numbers is the point. `jobs_extracted` is an
-immutable log of every observation: 16 sightings. `jobs_latest` resolves current
+immutable log of every observation: 20 sightings. `jobs_latest` resolves current
 state by ranking within each `source_job_id` on `ingested_at` and keeping rank 1:
 7 distinct postings.
 
@@ -58,7 +67,7 @@ items any single run processes.
 Nothing was overwritten to get there. Every earlier run's rows are still in the
 table, so first-seen date and re-listing history are both recoverable. The
 postings-over-time chart needs exactly that, and an upsert would have destroyed
-it. Deriving current state on read costs a window function over 16 rows.
+it. Deriving current state on read costs a window function over 20 rows.
 
 An earlier version had a primary key on `source_job_id`, which made the table
 upsert-shaped: the second run's inserts were rejected and `jobs_latest` was a
@@ -84,21 +93,23 @@ ORDER BY times_seen DESC;
 ```
  source_job_id | times_seen |       first_seen        |        last_seen
 ---------------+------------+-------------------------+-------------------------
- 2091098       |          4 | 2026-08-23 14:36:47.951 | 2026-09-02 15:00:37.808
- 2091100       |          2 | 2026-09-02 14:45:35.098 | 2026-09-02 15:00:37.806
- 2091101       |          2 | 2026-09-02 14:45:35.093 | 2026-09-02 15:00:37.805
+ 2091098       |          5 | 2026-08-23 14:36:47.951 | 2026-09-03 15:03:56.865
+ 2091099       |          3 | 2026-09-02 14:45:35.098 | 2026-09-03 15:03:56.862
+ 2091100       |          3 | 2026-09-02 14:45:35.098 | 2026-09-03 15:03:56.862
+ 2091101       |          3 | 2026-09-02 14:45:35.093 | 2026-09-03 15:03:56.86
  1919266       |          2 | 2026-08-23 14:36:47.951 | 2026-08-23 15:02:44.752
- 2091099       |          2 | 2026-09-02 14:45:35.098 | 2026-09-02 15:00:37.806
- 2091104       |          2 | 2026-08-23 14:36:47.951 | 2026-08-23 15:02:44.752
  2091097       |          2 | 2026-08-23 14:36:47.951 | 2026-08-23 15:02:44.752
+ 2091104       |          2 | 2026-08-23 14:36:47.951 | 2026-08-23 15:02:44.752
 ```
+
+Run against Neon. The same query on the local snapshot returns the same rows.
 
 Three lifecycle states, from one query over one table:
 
 - **Still open.** 2091098 was first seen on Aug 23 and was still in the feed on
-  Sep 2. Ten days open.
+  Sep 3. Eleven days open, and the only posting present in all five runs.
 - **New.** 2091099, 2091100 and 2091101 have a first_seen of Sep 2. They entered
-  the feed between the two dates.
+  the feed after Aug 23 and were still there on Sep 3.
 - **Gone.** 1919266, 2091097 and 2091104 were last seen on Aug 23 and have not
   appeared since. They dropped out of the feed.
 
@@ -109,25 +120,39 @@ second run.
 
 **One honest caveat.** The pipeline sat idle between Aug 23 and Sep 2, so
 `times_seen` is a count of runs that saw the posting, not a measure of how
-continuously the posting was listed. 2091098's 4 is four observations across two
-clusters of runs ten days apart, not four days of presence. `first_seen` and
-`last_seen` are real: those are the timestamps of actual observations. Anything
-derived from the count between them is not.
+continuously the posting was listed. 2091098's 5 is five observations across
+three clusters of runs — two on Aug 23, two on Sep 2, one on Sep 3 — not five
+days of presence. `first_seen` and `last_seen` are real: those are the
+timestamps of actual observations. Anything derived from the count between them
+is not.
 
-All three dead-letter rows are the same TELUS Digital listing, whose salary the
-model has repeatedly got wrong. In the captured fixtures it returned
-`salary_min: 0.2333` and `salary_max: 14`, having read "$0.2333 per completed
-task" and "$14 per hour" as one hourly range. Two real numbers in different
-units, which passes every type and bounds check and is only detectable because
-the range spans 60x. In the live runs it returned one bound and not the other,
-which fails as `SALARY_PARTIAL`. The 20x plausibility rule that catches the
-first case is exercised by the test suite, not by the rows currently in the
-table.
+All six dead-letter rows are the same TELUS Digital listing, whose salary the
+model has repeatedly got wrong. It returned `salary_min: 0.2333` and
+`salary_max: 14`, having read "$0.2333 per completed task" and "$14 per hour" as
+one hourly range. Two real numbers in different units, which passes every type
+and bounds check and is only detectable because the range spans 60x. On other
+runs it returned one bound and not the other, which fails as `SALARY_PARTIAL`.
+
+Five of the six rows are `SALARY_PARTIAL` and one is `SALARY_SPAN_IMPLAUSIBLE`,
+so the 20x plausibility rule is now exercised by a real row in the table and not
+only by the test suite. One posting, two distinct failure modes, both caught.
 
 ## The warehouse is Postgres, not BigQuery
 
-The design in `CLAUDE.md` says BigQuery. The implementation uses Postgres 16 in
-Docker, alongside n8n. The switch was forced, not preferred.
+The design in `CLAUDE.md` says BigQuery. The implementation uses Postgres. The
+switch was forced, not preferred.
+
+It started as Postgres 16 in Docker alongside n8n, and now runs on **Neon**
+(serverless Postgres 18) so the hosted dashboard can reach it — a Vercel
+function cannot connect to a container on a laptop. The local container is kept
+as the pre-migration snapshot and the rollback path; it holds an identical copy
+of every row, verified by matching MD5 over the full table.
+
+Only the host changed. Neon is ordinary Postgres, so the append-only model, the
+dedupe-on-read view and the validator contract all carried over untouched, and
+the `pg_dump` restored into PG 18 without a single compatibility fix. The one
+thing the move did change is documented in
+[Pooled connections do not carry a search_path](#pooled-connections-do-not-carry-a-search_path).
 
 BigQuery's Sandbox — the tier available without putting a card on file — blocks
 streaming inserts and DML. n8n's BigQuery node writes with `insertAll`, which is
@@ -138,7 +163,7 @@ in the existing compose file was the smallest change that kept the pipeline
 running end to end, and it costs nothing.
 
 What this loses: partitioning on `DATE(ingested_at)` and clustering on
-`source_job_id`, both of which were part of the append-only design. At 16 rows,
+`source_job_id`, both of which were part of the append-only design. At 20 rows,
 neither matters. At a scale where they would, Postgres wants an index rather
 than a partition, and none is created yet.
 
@@ -146,8 +171,8 @@ What it does not change: the append-only model, the dedupe-on-read view, the
 split between the two tables, and the validator contract. Those were warehouse
 decisions, not BigQuery decisions.
 
-`CLAUDE.md` and `.env.example` both still describe BigQuery and GCP setup. They
-are out of date on this point.
+`CLAUDE.md` still describes BigQuery and GCP setup, and still says the warehouse
+is Postgres in Docker. It is out of date on both points.
 
 ## How to run it
 
@@ -170,8 +195,12 @@ cases are single-line mutations of those fixtures. No test data is invented.
 1. Copy `.env.example` to `.env` and fill it in. `.env` is gitignored. Read the
    comments: n8n does not load that file, and values marked `[n8n UI]` are
    documentation of credentials you create by hand, not config that gets read.
-   The file has not been updated for the Postgres switch and still documents
-   GCP variables.
+   The file still documents unused GCP variables.
+
+   `NEON_DATABASE_URL` is the hosted warehouse. Leave it empty to run entirely
+   against the local container; set it to point the API and the pipeline at
+   Neon. Use the **pooled** connection string — the host contains `-pooler` —
+   and keep `?sslmode=require`, because Neon refuses unencrypted connections.
 
 2. Generate an encryption key for n8n's credential store. Losing it means
    re-entering every credential.
@@ -201,9 +230,16 @@ cases are single-line mutations of those fixtures. No test data is invented.
    kept so the two can be diffed.
 
 5. In the n8n UI, create the credentials: a Header Auth credential for Anthropic
-   with header name `x-api-key`, and a Postgres credential pointing at the
-   `roleradar` database. From n8n's container the host is `postgres`, not
-   `localhost`.
+   with header name `x-api-key`, and a Postgres credential.
+
+   For the local container: host `postgres` (not `localhost` — that is n8n's own
+   container), database `roleradar`, user `roleradar`, SSL disabled.
+
+   For Neon: host, database, user and password from `NEON_DATABASE_URL`, port
+   `5432`, and **SSL set to `require`**. The database is `neondb`, not
+   `roleradar`. Set the node's schema field to `public` explicitly rather than
+   relying on `search_path`; see
+   [Pooled connections do not carry a search_path](#pooled-connections-do-not-carry-a-search_path).
 
 6. Import or rebuild the workflow. `workflows/job-pipeline.json` is an export
    from the canvas, kept for the record.
@@ -216,13 +252,47 @@ cases are single-line mutations of those fixtures. No test data is invented.
    unchanged: the export on the last line is guarded with
    `typeof module !== 'undefined'`, so it is a no-op inside the Code node.
 
+### The dashboard
+
+The API reads `DATABASE_URL` if set, and falls back to the `POSTGRES_*` values
+otherwise. Nothing is hardcoded and no credential is in the repo.
+
+```
+python -m venv api/.venv && source api/.venv/bin/activate
+pip install -r api/requirements.txt
+```
+
+Against the hosted Neon warehouse — the same data the live URL serves:
+
+```
+export DATABASE_URL="$(grep '^NEON_DATABASE_URL=' .env | cut -d= -f2-)"
+uvicorn main:app --app-dir api --port 8000
+```
+
+Against the local container instead:
+
+```
+set -a && source .env && set +a
+uvicorn main:app --app-dir api --port 8000
+```
+
+Either way the dashboard is at `http://localhost:8000/`, which serves
+`api/static/index.html`. That file is self-contained and reads the API only, so
+copying it onto an nginx static root and setting `API_BASE` at the top of its
+script block to the API's address is also supported.
+
+To deploy: `vercel deploy --prod`. `DATABASE_URL` is set as an encrypted
+environment variable in the Vercel project, never in the repo.
+
 ### Costs
 
 The Anthropic API is the only line item that is not free. No free tier, prepaid
 credits, one call per job item. The Limit node is the ceiling on spend per run.
 A dev loop that forgets the cap and pulls 500 postings costs real money.
 
-Postgres and n8n are both self-hosted in Docker and cost nothing. The BigQuery
+n8n is self-hosted in Docker and costs nothing. Neon and Vercel are both on
+free tiers with no card attached: Neon suspends the compute when idle, and the
+dashboard's traffic is far inside Vercel's hobby limits. The BigQuery
 streaming-insert cost noted in `CLAUDE.md` no longer applies.
 
 ## Architecture decisions
@@ -315,6 +385,11 @@ the Code node would not have. Jest or Vitest would be nicer to write and would
 quietly let the tested code drift away from the deployed code.
 
 ## The dashboard
+
+![The RoleRadar metrics dashboard: a summary strip showing 26 records processed,
+80% success rate on the last run, 1 rejected, and time since the last run that
+produced data; beside it an ingestion volume chart and an extraction success
+rate chart with a tooltip open.](docs/dashboard.png)
 
 A FastAPI service in `api/` reads Postgres and serves four metric endpoints.
 `api/static/index.html` is a single self-contained file — Chart.js from a CDN,
@@ -491,10 +566,32 @@ A `classes[]` entry:
 
 ### Failure states
 
+![The same dashboard with the warehouse unreachable: the header pill reads
+"warehouse unreachable" in red, every summary tile reads "summary unavailable",
+and each panel shows "Could not load this panel" with the underlying connection
+error.](docs/dashboard-down.png)
+
 Each panel is in one of four states and shows which: loading, error, empty, or
 data. An endpoint that is unreachable or returns a non-2xx paints the panel with
 the error, not with an empty chart. A query that returns no rows paints "no runs
 recorded" over the plot area. An empty chart never looks like zero.
+
+**Slow and broken are shown differently.** Neon suspends the compute when idle,
+so the first request after a pause is slow rather than failed. A request still
+outstanding after 1.4s switches the panel to "waking the database" with an
+explanation, and the API's own cold-start timeout is retried once before
+anything is reported as an error.
+
+Telling those apart takes more than a timeout. `psycopg_pool` retries a failing
+connection until its deadline, so a warehouse that is refusing connections and
+one that is merely asleep both surface as the same `PoolTimeout` carrying the
+same uninformative message — which would collapse the distinction entirely. On
+that path the API probes once, directly and outside the pool, and reports what
+it finds. A refused connection, an unresolvable host or a rejected password all
+fail immediately and produce a real error worth showing; only a probe that also
+times out is genuinely ambiguous, and that is the sole case reported as "may be
+waking". The screenshot above is the refused case, which is why it reads
+unreachable rather than waking.
 
 ### Running it
 
@@ -615,12 +712,23 @@ verified by hand, not a guarantee. A migration tool would close the gap, and
 would also give the primary-key change above a recorded, replayable history
 instead of an `ALTER TABLE` someone ran once.
 
+The move to Neon doubled this problem. There are now two live databases — Neon
+and the local snapshot — and `sql/` describes both only for as long as nobody
+changes one of them. They are identical today because one was dumped into the
+other. Nothing keeps them that way.
+
 **The schedule only runs while the container does.** n8n holds the cron
 in-process, so a daily trigger fires only if `docker compose up` is still
 running at the time. Uptime is the laptop's uptime. Close the lid overnight and
 that day's run does not happen and is not retried — there is no catch-up on
 start. This is a consequence of self-hosting, not a bug, but it means gaps in
 `jobs_extracted` are gaps in observation, not evidence about the feed.
+
+Since the dashboard went to Vercel this is more visible, not less. The page is
+public and always reachable, so it now looks like a running system whether or
+not anything is ingesting. "Time since last run that produced data" measures
+laptop uptime as much as pipeline health, and a stale value there usually means
+the machine was off rather than that something broke.
 
 **`validate.js` is hand-pasted into the n8n Code node.** The file in this repo
 is the source of truth for the logic. The copy running in the canvas is a

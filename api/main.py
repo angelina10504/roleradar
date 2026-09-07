@@ -51,6 +51,10 @@ RUN_GAP = f"{RUN_GAP_MINUTES} minutes"
 # bounded, because a dashboard that hangs forever is worse than both.
 DB_TIMEOUT = float(os.environ.get("DB_TIMEOUT_SECONDS", "8"))
 
+# Seconds for the diagnostic probe below. Short: it runs only on a failure
+# path, and its answer is a message, not data.
+PROBE_TIMEOUT = float(os.environ.get("DB_PROBE_TIMEOUT_SECONDS", "2"))
+
 
 def connection_string() -> str:
     """Build the libpq connection string from the environment.
@@ -396,12 +400,42 @@ def run_query(sql: str, params: dict[str, Any] | None = None) -> list[dict]:
                 cur.execute(sql, params or {})
                 return [_jsonable(row) for row in cur.fetchall()]
     except PoolTimeout as exc:
-        raise DatabaseUnavailable(
-            f"no database connection within {DB_TIMEOUT:g}s "
-            f"(the database may be waking from suspend): {exc}"
-        ) from exc
+        raise DatabaseUnavailable(_explain_timeout()) from exc
     except psycopg.Error as exc:
         raise DatabaseUnavailable(str(exc).strip()) from exc
+
+
+WAKING = "the database may be waking from suspend"
+
+
+def _explain_timeout() -> str:
+    """Work out why the pool timed out, because the pool will not say.
+
+    psycopg_pool retries a failing connection until its deadline, so a
+    database that is refusing connections and one that is merely slow to wake
+    both arrive here as PoolTimeout with the same useless message. Reporting
+    both as "may be waking" would collapse the distinction the dashboard is
+    built to draw -- a suspended Neon compute and a dead warehouse are
+    different facts and the page shows them differently.
+
+    So probe once, directly, outside the pool. A refused connection, a bad
+    host or a rejected password all fail immediately and produce a real error
+    worth showing. Only a probe that also times out is genuinely ambiguous,
+    and that is the case where "waking" is the honest answer.
+    """
+    try:
+        with psycopg.connect(connection_string(), connect_timeout=PROBE_TIMEOUT):
+            # Connected on the second attempt: the pool was contended or the
+            # compute woke in between, not a failure worth naming.
+            return f"no pooled connection within {DB_TIMEOUT:g}s, though a direct one succeeded"
+    except psycopg.OperationalError as probe:
+        detail = " ".join(str(probe).split())
+        timed_out = "timeout expired" in detail.lower() or "timed out" in detail.lower()
+        if timed_out or not detail:
+            return f"no database connection within {DB_TIMEOUT:g}s ({WAKING})"
+        return detail
+    except Exception:
+        return f"no database connection within {DB_TIMEOUT:g}s ({WAKING})"
 
 
 def _jsonable(row: dict) -> dict:
