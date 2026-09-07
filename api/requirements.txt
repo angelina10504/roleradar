@@ -1,0 +1,5 @@
+# Pinned. The dashboard is a demo of the warehouse, not a place to discover
+# that a minor release changed a default.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+psycopg[binary,pool]==3.2.13

@@ -1,3 +1,15 @@
+-- STALE. Do not read this as the live schema.
+--
+-- This dump predates the primary-key fix. It shows jobs_extracted with
+-- PRIMARY KEY (source_job_id) and no id column, which is the upsert-shaped bug
+-- decision (a) exists to prevent. The live table has been checked and has
+-- PRIMARY KEY (id) plus the (source_job_id, ingested_at DESC) index, matching
+-- 01_jobs_extracted.sql.
+--
+-- Kept only as a record of what the schema used to be. Re-dump before trusting
+-- it again:
+--   docker exec roleradar-pg pg_dump -U roleradar -d roleradar --schema-only
+
 --
 -- PostgreSQL database dump
 --

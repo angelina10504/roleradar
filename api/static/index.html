@@ -1,0 +1,940 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RoleRadar — pipeline metrics</title>
+
+<!--
+  One self-contained file. Chart.js from a CDN, everything else inline. No
+  build step, no framework, no credentials. Copy it to an nginx static root and
+  set API_BASE below to wherever the FastAPI service lives.
+
+  It computes nothing. Every number on this page arrives already aggregated
+  from an endpoint, which got it from one query in sql/queries.sql. The only
+  arithmetic here is formatting a fraction as a percentage.
+-->
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+
+<style>
+  /* Colours are the validated default data-viz palette. The categorical slots
+     are assigned in fixed order and the dark column is stepped for the dark
+     surface, not flipped from the light one.
+
+     Status green and status red were the obvious choice for validated vs
+     rejected and are not used for it: that pair measures deutan Delta E 4.1,
+     which is the classic red/green trap. The volume series use categorical
+     slots 1/3/2 instead, which clear every gate in both modes. */
+  :root {
+    color-scheme: light;
+    --plane:        #f9f9f7;
+    --surface:      #fcfcfb;
+    --ink:          #0b0b0b;
+    --ink-2:        #52514e;
+    --ink-muted:    #898781;
+    --grid:         #e1e0d9;
+    --axis:         #c3c2b7;
+    --hairline:     rgba(11,11,11,0.10);
+
+    --series-1: #2a78d6;
+    --series-2: #eb6834;
+    --series-3: #1baf7a;
+    --series-4: #eda100;
+    --series-5: #e87ba4;
+
+    --good:     #0ca30c;
+    --warning:  #fab219;
+    --critical: #d03b3b;
+    --good-ink: #006300;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --plane:     #0d0d0d;
+      --surface:   #1a1a19;
+      --ink:       #ffffff;
+      --ink-2:     #c3c2b7;
+      --ink-muted: #898781;
+      --grid:      #2c2c2a;
+      --axis:      #383835;
+      --hairline:  rgba(255,255,255,0.10);
+
+      --series-1: #3987e5;
+      --series-2: #d95926;
+      --series-3: #199e70;
+      --series-4: #c98500;
+      --series-5: #d55181;
+
+      --good-ink: #0ca30c;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --plane:     #0d0d0d;
+    --surface:   #1a1a19;
+    --ink:       #ffffff;
+    --ink-2:     #c3c2b7;
+    --ink-muted: #898781;
+    --grid:      #2c2c2a;
+    --axis:      #383835;
+    --hairline:  rgba(255,255,255,0.10);
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+    --series-5: #d55181;
+    --good-ink: #0ca30c;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--plane);
+    color: var(--ink);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 20px 64px; }
+
+  /* --- header -------------------------------------------------------- */
+  header { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-end;
+           justify-content: space-between; margin-bottom: 6px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+  .sub { color: var(--ink-2); font-size: 13px; margin: 4px 0 0; max-width: 62ch; }
+
+  /* One filter row, above everything it scopes. Both charts and the table
+     re-render against the same slice. */
+  .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  label.ctl { color: var(--ink-2); font-size: 12px; display: flex; gap: 6px;
+              align-items: center; }
+  select, button {
+    font: inherit; font-size: 13px; color: var(--ink);
+    background: var(--surface); border: 1px solid var(--hairline);
+    border-radius: 7px; padding: 6px 10px; cursor: pointer;
+  }
+  button:hover, select:hover { border-color: var(--axis); }
+
+  .pill { display: inline-flex; align-items: center; gap: 7px; font-size: 12px;
+          padding: 5px 11px; border-radius: 999px; background: var(--surface);
+          border: 1px solid var(--hairline); color: var(--ink-2); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-muted); flex: none; }
+  .dot.up { background: var(--good); }
+  .dot.down { background: var(--critical); }
+
+  /* --- summary strip ------------------------------------------------- */
+  .strip { display: grid; gap: 14px; margin: 22px 0 18px;
+           grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+  .tile { background: var(--surface); border: 1px solid var(--hairline);
+          border-radius: 12px; padding: 15px 16px; min-height: 104px; }
+  .tile .k { font-size: 11.5px; letter-spacing: 0.03em; text-transform: uppercase;
+             color: var(--ink-muted); margin-bottom: 9px; }
+  /* Proportional figures on the big numbers; tabular-nums is for columns. */
+  .tile .v { font-size: 27px; font-weight: 600; line-height: 1.12;
+             letter-spacing: -0.02em; }
+  .tile .n { font-size: 12px; color: var(--ink-2); margin-top: 6px; }
+  .tile .n.warnish { color: var(--critical); }
+
+  /* --- cards --------------------------------------------------------- */
+  .row { display: grid; gap: 16px; margin-bottom: 16px;
+         grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); }
+  .card { background: var(--surface); border: 1px solid var(--hairline);
+          border-radius: 12px; padding: 16px 18px 18px; min-width: 0; }
+  .card-head { display: flex; justify-content: space-between; align-items: baseline;
+               gap: 12px; margin-bottom: 2px; flex-wrap: wrap; }
+  .card h2 { font-size: 14px; font-weight: 600; margin: 0; }
+  .card .desc { font-size: 12px; color: var(--ink-muted); margin: 3px 0 14px; }
+
+  /* Encoding switches, not data filters: they change what the mark means,
+     not which rows are in scope. */
+  .seg { display: inline-flex; border: 1px solid var(--hairline); border-radius: 7px;
+         overflow: hidden; flex: none; }
+  .seg button { border: 0; border-radius: 0; padding: 4px 10px; font-size: 12px;
+                background: transparent; color: var(--ink-2); }
+  .seg button[aria-pressed="true"] { background: var(--grid); color: var(--ink); }
+
+  /* Height includes the x-axis band, so the axis labels are never cropped
+     into a nested scrollbar. */
+  .plot { position: relative; height: 260px; }
+  .plot.short { height: 210px; }
+
+  /* --- panel states -------------------------------------------------- */
+  .state { display: none; padding: 26px 18px; border-radius: 9px; font-size: 13px;
+           border: 1px dashed var(--axis); color: var(--ink-2); text-align: center; }
+  .state.show { display: block; }
+  .state.err { border-style: solid; border-color: var(--critical);
+               color: var(--critical); text-align: left; }
+  .state .hint { display: block; color: var(--ink-muted); font-size: 12px;
+                 margin-top: 6px; }
+  .state code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                font-size: 11.5px; }
+  .hidden { display: none !important; }
+  .stale { opacity: 0.45; transition: opacity .15s; }
+
+  /* --- tables -------------------------------------------------------- */
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: right; padding: 7px 10px; white-space: nowrap;
+           border-bottom: 1px solid var(--grid); }
+  th:first-child, td:first-child { text-align: left; }
+  th { font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.03em;
+       color: var(--ink-muted); font-weight: 500; }
+  td.num { font-variant-numeric: tabular-nums; }
+  tbody tr:last-child td { border-bottom: 0; }
+
+  /* Status never rides on colour alone: glyph plus word, every time. */
+  .status { display: inline-flex; align-items: center; gap: 6px;
+            font-variant-numeric: normal; }
+  .status .g { font-size: 11px; line-height: 1; }
+  .status.ok       { color: var(--good-ink); }
+  .status.degraded { color: var(--ink-2); }
+  .status.failed   { color: var(--critical); }
+  .status.degraded .g { color: var(--warning); }
+
+  .swatch { display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+            margin-right: 7px; vertical-align: -1px; }
+
+  .delta { font-variant-numeric: tabular-nums; font-size: 12px; }
+  .delta.up { color: var(--good-ink); }
+  .delta.dn { color: var(--critical); }
+  .delta.flat { color: var(--ink-muted); }
+
+  footer { margin-top: 30px; padding-top: 18px; border-top: 1px solid var(--grid);
+           color: var(--ink-muted); font-size: 12px; max-width: 78ch; }
+  footer p { margin: 0 0 8px; }
+  footer b { color: var(--ink-2); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div>
+      <h1>RoleRadar pipeline metrics</h1>
+      <p class="sub">
+        Ingestion and extraction quality per n8n run, over the Postgres warehouse.
+        A run is a gap-delimited cluster of rows across <code>jobs_extracted</code>
+        and <code>dead_letter_log</code>.
+      </p>
+    </div>
+    <div class="controls">
+      <label class="ctl">Runs shown
+        <select id="limit">
+          <option value="10">Last 10</option>
+          <option value="30" selected>Last 30</option>
+          <option value="500">All</option>
+        </select>
+      </label>
+      <button id="refresh" type="button">Refresh</button>
+      <span class="pill" id="health"><span class="dot"></span><span id="health-text">checking…</span></span>
+    </div>
+  </header>
+
+  <!-- Summary strip -->
+  <section class="strip" id="strip">
+    <div class="tile">
+      <div class="k">Records processed</div>
+      <div class="v" id="t-total">—</div>
+      <div class="n" id="t-total-n">&nbsp;</div>
+    </div>
+    <div class="tile">
+      <div class="k">Success rate, last run</div>
+      <div class="v" id="t-rate">—</div>
+      <div class="n" id="t-rate-n">&nbsp;</div>
+    </div>
+    <div class="tile">
+      <div class="k">Rejected in last run</div>
+      <div class="v" id="t-rej">—</div>
+      <div class="n" id="t-rej-n">&nbsp;</div>
+    </div>
+    <div class="tile">
+      <div class="k">Since last run that produced data</div>
+      <div class="v" id="t-since">—</div>
+      <div class="n" id="t-since-n">&nbsp;</div>
+    </div>
+  </section>
+
+  <div class="row">
+    <!-- Ingestion volume -->
+    <section class="card">
+      <div class="card-head">
+        <h2>Ingestion volume</h2>
+        <div class="seg" role="group" aria-label="Volume basis">
+          <button type="button" data-vol="per_run" aria-pressed="true">Per run</button>
+          <button type="button" data-vol="cumulative" aria-pressed="false">Cumulative</button>
+        </div>
+      </div>
+      <p class="desc" id="vol-desc">
+        Rows processed per run, not rows available upstream. The n8n Limit node caps
+        each run — currently at 5 — so a flat line at the cap is the cost control
+        working, not the feed drying up.
+      </p>
+      <div class="plot"><canvas id="c-volume"></canvas></div>
+      <div class="state" id="s-volume"></div>
+    </section>
+
+    <!-- Success rate -->
+    <section class="card">
+      <div class="card-head"><h2>Extraction success rate</h2></div>
+      <p class="desc">
+        Validated ÷ ingested per run. At five rows per run one rejection is a
+        20-point swing, so the 3-run rolling mean is plotted beside it.
+      </p>
+      <div class="plot"><canvas id="c-rate"></canvas></div>
+      <div class="state" id="s-rate"></div>
+    </section>
+  </div>
+
+  <div class="row">
+    <!-- Error classes -->
+    <section class="card">
+      <div class="card-head">
+        <h2>Rejection reasons</h2>
+        <div class="seg" role="group" aria-label="Counting basis">
+          <button type="button" data-err="rows" aria-pressed="true">Rows</button>
+          <button type="button" data-err="occurrences" aria-pressed="false">Occurrences</button>
+        </div>
+      </div>
+      <p class="desc" id="err-desc">
+        Dead-lettered postings by error code, coloured by category.
+      </p>
+      <div class="plot"><canvas id="c-errors"></canvas></div>
+      <div class="state" id="s-errors"></div>
+      <div class="tablewrap" id="err-table-wrap"></div>
+    </section>
+
+    <!-- Model disagreement -->
+    <section class="card">
+      <div class="card-head"><h2>Model disagreement rate</h2></div>
+      <p class="desc">
+        How often the model's <code>mentions_n8n</code> disagreed with
+        <code>/\bn8n\b/i</code> over the description. A floor, not an exact rate.
+      </p>
+      <div class="plot short"><canvas id="c-model"></canvas></div>
+      <div class="state" id="s-model"></div>
+      <div class="tablewrap" id="model-table-wrap"></div>
+    </section>
+  </div>
+
+  <!-- Recent runs. Also the table view for the two charts above it. -->
+  <section class="card">
+    <div class="card-head"><h2>Recent runs</h2></div>
+    <p class="desc">
+      Newest first. Δ is the change in success rate from the previous run.
+    </p>
+    <div class="state" id="s-runs"></div>
+    <div class="tablewrap" id="runs-table-wrap"></div>
+  </section>
+
+  <footer>
+    <p><b>Ingested</b> means processed, not available. It counts what the pipeline put
+    through the model, not what Remotive had — <code>DEV_JOB_LIMIT</code> caps each run, currently at 5. Runs recorded before that cap was set can exceed it.</p>
+    <p><b>Rejection reasons</b> count rows by default: how many postings carry the code.
+    Occurrences counts entries in <code>errors_json</code>, so one row with three bad
+    enums counts three times. The two differ and the toggle says which is on screen.</p>
+    <p><b>This page cannot see infra failures.</b> A run that died before writing to
+    Postgres leaves no rows, so it is not a run here at all. The recent-runs table will
+    look clean through an outage; a stale "since last run that produced data" is the
+    only signal.</p>
+  </footer>
+</div>
+
+<script>
+"use strict";
+
+/* Where the API lives. Empty string = same origin, which is what happens when
+   FastAPI serves this file. Set it to e.g. "http://10.0.0.4:8000" when nginx
+   serves the page from a different host. No credentials here, ever. */
+const API_BASE = "";
+
+/* ------------------------------------------------------------------ *
+ * Palette + chart chrome, read from CSS so light and dark come from
+ * one place and a theme change is a re-render rather than a second
+ * hardcoded table.
+ * ------------------------------------------------------------------ */
+const cssVar = n => getComputedStyle(document.documentElement)
+                      .getPropertyValue(n).trim();
+
+function theme() {
+  return {
+    s1: cssVar("--series-1"), s2: cssVar("--series-2"), s3: cssVar("--series-3"),
+    s4: cssVar("--series-4"), s5: cssVar("--series-5"),
+    ink: cssVar("--ink"), ink2: cssVar("--ink-2"), muted: cssVar("--ink-muted"),
+    grid: cssVar("--grid"), axis: cssVar("--axis"), surface: cssVar("--surface"),
+  };
+}
+
+/* Fixed category order, so a category keeps its colour when the set of
+   categories present changes. Colour follows the entity, never its rank. */
+const CATEGORY_SLOT = {
+  schema: "s1",
+  model_disagreement: "s2",
+  salary_logic: "s3",
+  provenance: "s4",
+  envelope: "s5",
+};
+
+/* ------------------------------------------------------------------ *
+ * Formatting. The only arithmetic on this page.
+ * ------------------------------------------------------------------ */
+const pct = (f, dp = 1) =>
+  (f === null || f === undefined) ? "—" : (f * 100).toFixed(dp) + "%";
+
+const num = n => (n === null || n === undefined) ? "—" : Number(n).toLocaleString();
+
+function shortTime(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso + (iso.endsWith("Z") ? "" : "Z"));
+  return d.toLocaleString(undefined, {
+    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+  });
+}
+
+function duration(seconds) {
+  if (seconds === null || seconds === undefined) return "never";
+  const s = Math.max(0, Math.floor(seconds));
+  if (s < 90) return s + "s";
+  const m = Math.floor(s / 60);
+  if (m < 90) return m + "m";
+  const h = Math.floor(m / 60);
+  if (h < 48) return h + "h " + (m % 60) + "m";
+  return Math.floor(h / 24) + "d " + (h % 24) + "h";
+}
+
+const STATUS_GLYPH = { ok: "●", degraded: "▲", failed: "✕" };
+
+function statusCell(status) {
+  if (!status) return "—";
+  const g = STATUS_GLYPH[status] || "•";
+  return `<span class="status ${status}"><span class="g">${g}</span>${status}</span>`;
+}
+
+const esc = s => String(s).replace(/[&<>"]/g,
+  c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+/* ------------------------------------------------------------------ *
+ * Panel state. Four states, and the page always says which one it is
+ * in. An endpoint that is down and a pipeline that ingested nothing
+ * look identical on an empty chart and mean opposite things, so
+ * neither is ever drawn as a chart of zeros.
+ * ------------------------------------------------------------------ */
+function setState(panelId, kind, message, hint) {
+  const el = document.getElementById("s-" + panelId);
+  const plot = el.previousElementSibling;
+  el.className = "state show" + (kind === "error" ? " err" : "");
+  el.innerHTML = kind === "error"
+    ? `<b>Could not load this panel.</b><span class="hint">${esc(message)}</span>`
+    : `${esc(message)}${hint ? `<span class="hint">${esc(hint)}</span>` : ""}`;
+  if (plot && plot.classList.contains("plot")) plot.classList.add("hidden");
+}
+
+function clearState(panelId) {
+  const el = document.getElementById("s-" + panelId);
+  el.className = "state";
+  el.innerHTML = "";
+  const plot = el.previousElementSibling;
+  if (plot && plot.classList.contains("plot")) plot.classList.remove("hidden");
+}
+
+/* ------------------------------------------------------------------ *
+ * Fetch. A non-2xx carries the API's own detail through to the panel
+ * rather than collapsing to "failed".
+ * ------------------------------------------------------------------ */
+async function getJSON(path) {
+  let res;
+  try {
+    res = await fetch(API_BASE + path, { headers: { Accept: "application/json" } });
+  } catch (e) {
+    throw new Error(`${path} unreachable — ${e.message}`);
+  }
+  let body = null;
+  try { body = await res.json(); } catch (e) { /* fall through to status */ }
+  if (!res.ok) {
+    const detail = body && (body.detail || body.error) ? (body.detail || body.error) : res.statusText;
+    throw new Error(`${path} returned ${res.status} — ${detail}`);
+  }
+  return body;
+}
+
+/* ------------------------------------------------------------------ *
+ * Chart defaults: thin marks, hairline recessive grid, no dashes.
+ * ------------------------------------------------------------------ */
+const charts = {};
+
+function destroy(id) {
+  if (charts[id]) { charts[id].destroy(); delete charts[id]; }
+}
+
+/* Selective direct labels: the series name at its last point only, never a
+   number on every point. Satisfies the relief rule for the sub-3:1 slots. */
+const endLabels = {
+  id: "endLabels",
+  afterDatasetsDraw(chart, args, opts) {
+    if (!opts || opts.enabled === false) return;
+    const { ctx } = chart;
+    ctx.save();
+    ctx.font = "600 11px system-ui, -apple-system, sans-serif";
+    ctx.textBaseline = "middle";
+    /* Collect first, then de-collide. Two series that finish on the same
+       value would otherwise overprint each other into unreadable mush. */
+    const marks = [];
+    chart.data.datasets.forEach((ds, i) => {
+      const meta = chart.getDatasetMeta(i);
+      if (meta.hidden || !meta.data.length) return;
+      const last = meta.data[meta.data.length - 1];
+      if (!last) return;
+      marks.push({ label: ds.label, color: ds.borderColor, x: last.x, y: last.y - 12 });
+    });
+    marks.sort((a, b) => a.y - b.y);
+    const MIN_GAP = 15;
+    for (let i = 1; i < marks.length; i++) {
+      if (marks[i].y - marks[i - 1].y < MIN_GAP) marks[i].y = marks[i - 1].y + MIN_GAP;
+    }
+    const top = chart.chartArea.top + 6, bottom = chart.chartArea.bottom - 4;
+    marks.forEach(m => {
+      ctx.fillStyle = m.color;
+      ctx.textAlign = "right";
+      ctx.fillText(m.label, m.x - 10, Math.min(bottom, Math.max(top, m.y)));
+    });
+    ctx.restore();
+  },
+};
+
+function baseOptions(t, yTitle, yFmt) {
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    layout: { padding: { top: 8, right: 8 } },
+    interaction: { mode: "index", intersect: false },
+    plugins: {
+      legend: {
+        display: true,
+        position: "bottom",
+        align: "start",
+        labels: {
+          boxWidth: 9, boxHeight: 9, usePointStyle: true, pointStyle: "rectRounded",
+          color: t.ink2, font: { size: 12 }, padding: 16,
+        },
+      },
+      tooltip: {
+        backgroundColor: t.surface, borderColor: t.axis, borderWidth: 1,
+        titleColor: t.ink, bodyColor: t.ink2, padding: 10, displayColors: true,
+        boxWidth: 9, boxHeight: 9, usePointStyle: true, cornerRadius: 7,
+        callbacks: {
+          label: c => ` ${c.dataset.label}: ${yFmt ? yFmt(c.parsed.y) : c.parsed.y}`,
+        },
+      },
+      endLabels: { enabled: true },
+    },
+    scales: {
+      x: {
+        grid: { display: false },
+        border: { color: t.axis },
+        ticks: { color: t.muted, font: { size: 11 }, maxRotation: 0, autoSkipPadding: 14 },
+      },
+      y: {
+        beginAtZero: true,
+        title: yTitle ? { display: true, text: yTitle, color: t.muted, font: { size: 11 } } : undefined,
+        grid: { color: t.grid, drawTicks: false },
+        border: { display: false },
+        ticks: { color: t.muted, font: { size: 11 }, padding: 8, maxTicksLimit: 6,
+                 callback: v => (yFmt ? yFmt(v) : v) },
+      },
+    },
+  };
+}
+
+function line(color, label, extra) {
+  return Object.assign({
+    label, data: [],
+    borderColor: color, backgroundColor: color,
+    borderWidth: 2, tension: 0.25,
+    pointRadius: 4, pointHoverRadius: 7,
+    pointBackgroundColor: color,
+    /* 2px surface ring, so overlapping markers stay separable. */
+    pointBorderColor: cssVar("--surface"), pointBorderWidth: 2,
+    hitRadius: 14,
+  }, extra || {});
+}
+
+/* ------------------------------------------------------------------ *
+ * Panels
+ * ------------------------------------------------------------------ */
+const state = { runs: [], errors: null, volMode: "per_run", errMetric: "rows" };
+
+function renderVolume() {
+  destroy("volume");
+  const t = theme(), runs = state.runs;
+  if (!runs.length) return;
+  const labels = runs.map(r => shortTime(r.run_started_at));
+  const cum = state.volMode === "cumulative";
+
+  document.getElementById("vol-desc").textContent = cum
+    ? "Running total of rows processed, from the first recorded run onward. The lifetime total, not the window's."
+    : "Rows processed per run, not rows available upstream. The n8n Limit node caps each run — currently at 5 — so a flat line at the cap is the cost control working, not the feed drying up.";
+
+  const datasets = cum
+    ? [
+        Object.assign(line(t.s1, "Ingested"),  { data: runs.map(r => r.cumulative_ingested) }),
+        Object.assign(line(t.s3, "Validated"), { data: runs.map(r => r.cumulative_validated) }),
+      ]
+    : [
+        Object.assign(line(t.s1, "Ingested"),  { data: runs.map(r => r.ingested) }),
+        Object.assign(line(t.s3, "Validated"), { data: runs.map(r => r.validated) }),
+        Object.assign(line(t.s2, "Rejected"),  { data: runs.map(r => r.rejected) }),
+      ];
+
+  charts.volume = new Chart(document.getElementById("c-volume"), {
+    type: "line",
+    data: { labels, datasets },
+    options: baseOptions(t, "rows", v => num(v)),
+    plugins: [endLabels],
+  });
+}
+
+function renderRate() {
+  destroy("rate");
+  const t = theme(), runs = state.runs;
+  if (!runs.length) return;
+  const opts = baseOptions(t, "success rate", v => pct(v, 0));
+  opts.scales.y.max = 1;
+  opts.plugins.tooltip.callbacks.label =
+    c => ` ${c.dataset.label}: ${c.parsed.y === null ? "—" : pct(c.parsed.y)}`;
+
+  charts.rate = new Chart(document.getElementById("c-rate"), {
+    type: "line",
+    data: {
+      labels: runs.map(r => shortTime(r.run_started_at)),
+      datasets: [
+        Object.assign(line(t.s1, "Per run"), { data: runs.map(r => r.success_rate) }),
+        Object.assign(line(t.s2, "3-run mean"), {
+          data: runs.map(r => r.success_rate_rolling3),
+          pointRadius: 0, pointHoverRadius: 6, borderWidth: 2,
+        }),
+      ],
+    },
+    options: opts,
+    plugins: [endLabels],
+  });
+}
+
+function renderErrors() {
+  destroy("errors");
+  const t = theme(), payload = state.errors;
+  if (!payload || !payload.classes.length) return;
+  const metric = state.errMetric;
+  const classes = payload.classes.slice().sort((a, b) => b[metric] - a[metric]);
+
+  document.getElementById("err-desc").innerHTML = metric === "rows"
+    ? `Dead-lettered postings carrying each code, coloured by category. <b>${payload.total_rejected_rows}</b> rejected rows in total.`
+    : `Entries in <code>errors_json</code> carrying each code, coloured by category. One row with three bad enums counts three times. <b>${payload.total_code_occurrences}</b> occurrences in total.`;
+
+  /* A code can appear under two categories — provenance MISSING and schema
+     MISSING are different failures with the same code — so the label carries
+     the category whenever the code alone is ambiguous. */
+  const seen = {};
+  classes.forEach(c => { seen[c.code] = (seen[c.code] || 0) + 1; });
+  const labels = classes.map(c => seen[c.code] > 1 ? `${c.code} (${c.category})` : c.code);
+  const colors = classes.map(c => t[CATEGORY_SLOT[c.category] || "s1"]);
+
+  const opts = baseOptions(t, null, v => num(v));
+  opts.indexAxis = "y";
+  opts.plugins.legend.display = false;   /* categories are in the table below */
+  opts.interaction = { mode: "nearest", intersect: true };
+  opts.scales.x = {
+    beginAtZero: true,
+    grid: { color: t.grid, drawTicks: false },
+    border: { display: false },
+    ticks: { color: t.muted, font: { size: 11 }, precision: 0 },
+  };
+  opts.scales.y = {
+    grid: { display: false },
+    border: { color: t.axis },
+    ticks: { color: t.ink2, font: { size: 11 } },
+  };
+  opts.plugins.tooltip.callbacks.label = c => {
+    const row = classes[c.dataIndex];
+    return ` ${row.category} · ${row.rows} row${row.rows === 1 ? "" : "s"}, ${row.occurrences} occurrence${row.occurrences === 1 ? "" : "s"}`;
+  };
+  opts.plugins.endLabels = { enabled: false };
+
+  const canvas = document.getElementById("c-errors");
+  canvas.parentElement.style.height =
+    Math.max(150, classes.length * 46 + 56) + "px";
+
+  charts.errors = new Chart(canvas, {
+    type: "bar",
+    data: {
+      labels,
+      datasets: [{
+        label: metric,
+        data: classes.map(c => c[metric]),
+        backgroundColor: colors,
+        borderRadius: 4,          /* 4px rounded data-end, anchored at zero */
+        borderSkipped: "start",
+        barThickness: 16,
+        /* 2px surface gap between adjacent bars rather than a border. */
+        borderColor: t.surface,
+        borderWidth: { top: 1, bottom: 1, left: 0, right: 0 },
+      }],
+    },
+    options: opts,
+  });
+
+  document.getElementById("err-table-wrap").innerHTML = `
+    <table>
+      <thead><tr>
+        <th>Code</th><th>Category</th><th>Rows</th><th>Occur.</th><th>% of rows</th>
+      </tr></thead>
+      <tbody>${classes.map(c => `
+        <tr>
+          <td><span class="swatch" style="background:${t[CATEGORY_SLOT[c.category] || "s1"]}"></span>${esc(c.code)}</td>
+          <td>${esc(c.category)}</td>
+          <td class="num">${c.rows}</td>
+          <td class="num">${c.occurrences}</td>
+          <td class="num">${pct(c.pct_of_rejected_rows)}</td>
+        </tr>`).join("")}</tbody>
+    </table>`;
+}
+
+function renderModel(payload) {
+  destroy("model");
+  const t = theme();
+  const byRun = payload.by_run || [];
+  if (byRun.length) {
+    const opts = baseOptions(t, "disagreement", v => pct(v, 0));
+    opts.scales.y.max = 1;
+    opts.plugins.legend.display = false;   /* one series; the title names it */
+    opts.plugins.endLabels = { enabled: false };
+    opts.plugins.tooltip.callbacks.label = c => {
+      const r = byRun[c.dataIndex];
+      return ` ${pct(r.mismatch_rate)} — ${r.mismatches} of ${r.processed} processed`;
+    };
+    charts.model = new Chart(document.getElementById("c-model"), {
+      type: "line",
+      data: {
+        labels: byRun.map(r => shortTime(r.run_started_at)),
+        datasets: [Object.assign(line(t.s1, "Disagreement rate"),
+                                 { data: byRun.map(r => r.mismatch_rate) })],
+      },
+      options: opts,
+    });
+  }
+
+  const rows = payload.by_version || [];
+  document.getElementById("model-table-wrap").innerHTML = rows.length ? `
+    <table>
+      <thead><tr>
+        <th>Model</th><th>Version</th><th>Processed</th><th>Mismatches</th><th>Rate</th>
+      </tr></thead>
+      <tbody>${rows.map(r => `
+        <tr>
+          <td>${esc(r.model)}</td>
+          <td>${esc(r.extraction_version)}</td>
+          <td class="num">${num(r.processed)}</td>
+          <td class="num">${num(r.mismatches)}</td>
+          <td class="num">${pct(r.mismatch_rate)}</td>
+        </tr>`).join("")}</tbody>
+    </table>` : "";
+}
+
+function renderRunsTable() {
+  const runs = state.runs.slice().reverse();   /* newest first */
+  document.getElementById("runs-table-wrap").innerHTML = runs.length ? `
+    <table>
+      <thead><tr>
+        <th>Run started</th><th>In</th><th>Validated</th><th>Rejected</th>
+        <th>Success</th><th>Δ</th><th>Status</th>
+      </tr></thead>
+      <tbody>${runs.map(r => {
+        const d = r.success_rate_delta;
+        const cls = d === null || d === undefined ? "flat" : d > 0 ? "up" : d < 0 ? "dn" : "flat";
+        const txt = d === null || d === undefined ? "—"
+                  : (d > 0 ? "+" : "") + (d * 100).toFixed(1) + "pp";
+        return `<tr>
+          <td>${shortTime(r.run_started_at)}</td>
+          <td class="num">${num(r.ingested)}</td>
+          <td class="num">${num(r.validated)}</td>
+          <td class="num">${num(r.rejected)}</td>
+          <td class="num">${pct(r.success_rate)}</td>
+          <td class="num"><span class="delta ${cls}">${txt}</span></td>
+          <td>${statusCell(r.status)}</td>
+        </tr>`;
+      }).join("")}</tbody>
+    </table>` : "";
+}
+
+function renderSummary(s) {
+  const set = (id, v) => { document.getElementById(id).textContent = v; };
+  const setN = (id, html, warn) => {
+    const el = document.getElementById(id);
+    el.innerHTML = html;
+    el.classList.toggle("warnish", !!warn);
+  };
+
+  if (!s.run_count) {
+    ["t-total", "t-rate", "t-rej", "t-since"].forEach(id => set(id, "—"));
+    ["t-total-n", "t-rate-n", "t-rej-n", "t-since-n"]
+      .forEach(id => setN(id, "no runs recorded"));
+    return;
+  }
+
+  set("t-total", num(s.totals.ingested));
+  setN("t-total-n", `${num(s.totals.validated)} validated · ${num(s.totals.rejected)} rejected`);
+
+  const lr = s.last_run;
+  set("t-rate", pct(lr.success_rate));
+  setN("t-rate-n",
+    `${pct(s.totals.success_rate)} all time, across ${num(s.run_count)} run${s.run_count === 1 ? "" : "s"}`);
+
+  set("t-rej", num(lr.rejected));
+  setN("t-rej-n", `of ${num(lr.ingested)} processed · ${statusCell(lr.status)}`);
+
+  set("t-since", duration(s.seconds_since_last_successful_run));
+  setN("t-since-n", s.last_successful_run_at
+    ? shortTime(s.last_successful_run_at)
+    : "no run has produced a row");
+}
+
+/* ------------------------------------------------------------------ *
+ * Load. Panels fail independently: one dead endpoint greys one card
+ * rather than blanking the page.
+ * ------------------------------------------------------------------ */
+async function loadHealth() {
+  const pill = document.getElementById("health");
+  const dot = pill.querySelector(".dot");
+  const txt = document.getElementById("health-text");
+  try {
+    const h = await getJSON("/api/health");
+    dot.className = "dot up";
+    txt.textContent = "warehouse reachable";
+    pill.title = "checked " + h.checked_at + "Z";
+  } catch (e) {
+    dot.className = "dot down";
+    txt.textContent = "warehouse unreachable";
+    pill.title = e.message;
+  }
+}
+
+async function loadRuns(limit) {
+  try {
+    const d = await getJSON("/api/runs?limit=" + limit);
+    state.runs = d.runs;
+    if (!d.row_count) {
+      const msg = "No runs recorded.";
+      const hint = "jobs_extracted and dead_letter_log are both empty for this window. This is an empty result, not a zero.";
+      setState("volume", "empty", msg, hint);
+      setState("rate", "empty", msg, hint);
+      setState("runs", "empty", msg, hint);
+      destroy("volume"); destroy("rate");
+      document.getElementById("runs-table-wrap").innerHTML = "";
+      return;
+    }
+    clearState("volume"); clearState("rate"); clearState("runs");
+    renderVolume(); renderRate(); renderRunsTable();
+  } catch (e) {
+    ["volume", "rate", "runs"].forEach(p => setState(p, "error", e.message));
+    destroy("volume"); destroy("rate");
+    document.getElementById("runs-table-wrap").innerHTML = "";
+  }
+}
+
+async function loadSummary() {
+  try {
+    renderSummary(await getJSON("/api/summary"));
+  } catch (e) {
+    ["t-total", "t-rate", "t-rej", "t-since"]
+      .forEach(id => { document.getElementById(id).textContent = "—"; });
+    ["t-total-n", "t-rate-n", "t-rej-n", "t-since-n"].forEach(id => {
+      const el = document.getElementById(id);
+      el.textContent = "summary unavailable";
+      el.classList.add("warnish");
+    });
+    document.getElementById("t-total-n").title = e.message;
+  }
+}
+
+async function loadErrors() {
+  try {
+    const d = await getJSON("/api/error-classes");
+    state.errors = d;
+    if (!d.row_count) {
+      setState("errors", "empty", "Nothing has been rejected.",
+        "dead_letter_log is empty. A dead-letter table that has never been exercised is not evidence that validation works.");
+      destroy("errors");
+      document.getElementById("err-table-wrap").innerHTML = "";
+      return;
+    }
+    clearState("errors");
+    renderErrors();
+  } catch (e) {
+    setState("errors", "error", e.message);
+    destroy("errors");
+    document.getElementById("err-table-wrap").innerHTML = "";
+  }
+}
+
+async function loadModel() {
+  try {
+    const d = await getJSON("/api/model-accuracy");
+    if (!d.row_count) {
+      setState("model", "empty", "Nothing processed yet.",
+        "No rows in either table, so there is no disagreement rate to compute.");
+      destroy("model");
+      document.getElementById("model-table-wrap").innerHTML = "";
+      return;
+    }
+    clearState("model");
+    renderModel(d);
+  } catch (e) {
+    setState("model", "error", e.message);
+    destroy("model");
+    document.getElementById("model-table-wrap").innerHTML = "";
+  }
+}
+
+async function loadAll() {
+  const limit = document.getElementById("limit").value;
+  /* Hold the previous render at reduced opacity rather than flashing a
+     skeleton, so nothing jumps on refresh. */
+  document.querySelectorAll(".card, .strip").forEach(el => el.classList.add("stale"));
+  await Promise.all([loadHealth(), loadRuns(limit), loadSummary(), loadErrors(), loadModel()]);
+  document.querySelectorAll(".card, .strip").forEach(el => el.classList.remove("stale"));
+}
+
+/* --- wiring -------------------------------------------------------- */
+document.getElementById("refresh").addEventListener("click", loadAll);
+document.getElementById("limit").addEventListener("change", loadAll);
+
+document.querySelectorAll("[data-vol]").forEach(b => {
+  b.addEventListener("click", () => {
+    state.volMode = b.dataset.vol;
+    document.querySelectorAll("[data-vol]").forEach(o =>
+      o.setAttribute("aria-pressed", String(o === b)));
+    if (state.runs.length) renderVolume();
+  });
+});
+
+document.querySelectorAll("[data-err]").forEach(b => {
+  b.addEventListener("click", () => {
+    state.errMetric = b.dataset.err;
+    document.querySelectorAll("[data-err]").forEach(o =>
+      o.setAttribute("aria-pressed", String(o === b)));
+    if (state.errors) renderErrors();
+  });
+});
+
+/* Dark mode is a re-render, not a CSS-only flip: Chart.js bakes colours into
+   the canvas at construction time. */
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+  if (state.runs.length) { renderVolume(); renderRate(); }
+  if (state.errors) renderErrors();
+  loadModel();
+});
+
+loadAll();
+</script>
+</body>
+</html>
