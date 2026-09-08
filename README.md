@@ -16,6 +16,46 @@ The dashboard and the warehouse are hosted. The pipeline above is not — n8n ru
 in Docker on a laptop, so ingestion happens only while that machine is up. The
 live URL is not evidence of continuous operation. See [Deployment](#deployment).
 
+## Contents
+
+- [What it does](#what-it-does)
+  - [What is actually in the warehouse](#what-is-actually-in-the-warehouse)
+  - [The lifecycle query](#the-lifecycle-query)
+- [The warehouse is Postgres, not BigQuery](#the-warehouse-is-postgres-not-bigquery)
+- [How to run it](#how-to-run-it)
+  - [The validator](#the-validator)
+  - [The pipeline](#the-pipeline)
+  - [The API and dashboard](#the-api-and-dashboard)
+  - [Costs](#costs)
+- [Architecture decisions](#architecture-decisions)
+  - [Data validation and infra failure are different events](#data-validation-and-infra-failure-are-different-events)
+  - [jobs_extracted is append-only, by design](#jobs_extracted-is-append-only-by-design)
+  - [Source and model output stay separate](#source-and-model-output-stay-separate)
+  - [`extracted` is the whole Anthropic message](#extracted-is-the-whole-anthropic-message)
+  - [mentions_n8n is cross-checked, not trusted](#mentions_n8n-is-cross-checked-not-trusted)
+  - [The description is not stored with the extracted row](#the-description-is-not-stored-with-the-extracted-row)
+  - [The validator has no npm dependencies](#the-validator-has-no-npm-dependencies)
+- [The dashboard](#the-dashboard)
+  - [What a run is](#what-a-run-is)
+  - [Definitions](#definitions)
+  - [The error-class chart counts rows, not code occurrences](#the-error-class-chart-counts-rows-not-code-occurrences)
+  - [Model disagreement rate](#model-disagreement-rate)
+  - [What the dashboard cannot see](#what-the-dashboard-cannot-see)
+  - [Endpoints](#endpoints)
+  - [Failure states](#failure-states)
+  - [Pooled connections do not carry a search_path](#pooled-connections-do-not-carry-a-search_path)
+- [Deployment](#deployment)
+  - [What is hosted and what is not](#what-is-hosted-and-what-is-not)
+  - [Configuration](#configuration)
+- [Known limitations](#known-limitations)
+  - [Correctness risks](#correctness-risks)
+  - [Operational gaps](#operational-gaps)
+  - [Accepted trade-offs](#accepted-trade-offs)
+  - [Known bugs](#known-bugs)
+- [Not yet built](#not-yet-built)
+  - [1. The Error Trigger workflow](#1-the-error-trigger-workflow)
+  - [2. The Remotive `publication_date` column](#2-the-remotive-publication_date-column)
+
 ## What it does
 
 The workflow runs end to end. One scheduled run:
@@ -252,7 +292,7 @@ cases are single-line mutations of those fixtures. No test data is invented.
    unchanged: the export on the last line is guarded with
    `typeof module !== 'undefined'`, so it is a no-op inside the Code node.
 
-### The dashboard
+### The API and dashboard
 
 The API reads `DATABASE_URL` if set, and falls back to the `POSTGRES_*` values
 otherwise. Nothing is hardcoded and no credential is in the repo.
@@ -693,6 +733,39 @@ Vercel URL is still a supported way to serve it.
 
 These are real weaknesses, not details.
 
+### Correctness risks
+
+Things that can produce wrong data or wrong conclusions without announcing themselves.
+
+**`validate.js` is hand-pasted into the n8n Code node.** The file in this repo
+is the source of truth for the logic. The copy running in the canvas is a
+deployed duplicate. There is no import path from the canvas into this repo, so
+the two can drift. When the validator changes, the Code node has to be
+re-pasted, and nothing enforces that. Passing tests here are not evidence that
+the deployed copy matches.
+
+**Fixtures pair positionally.** `fixtures/extraction-output.json` carries no
+`source_job_id`, so the only join key between it and
+`fixtures/source-records.json` is array index. Reordering or partially
+re-capturing one file would silently validate one job's extraction against
+another job's description. The tests assert the two arrays are the same length
+so a reorder fails loudly, but equal length is not the same as correct
+alignment.
+
+**`ingested_at` has two different types.** `timestamp` in `jobs_extracted`,
+`timestamptz` in `dead_letter_log`. The same ISO-8601 string is written to both
+and one drops the offset. Joining or comparing the two tables on time will not
+behave until they agree.
+
+**`EXTRACTION_VERSION` is defined in two places and they disagree.**
+`validate.js` hardcodes `'1.0.0'`, which is what reaches the rows.
+`.env.example` documents `EXTRACTION_VERSION=v1`, which is not wired to
+anything.
+
+### Operational gaps
+
+Missing scaffolding. Nothing here is wrong today; each is something that has to be done by hand and therefore eventually will not be.
+
 **The schema is documented, not managed.** The tables were created by hand in
 `psql`. The files in `sql/` describe the live database rather than build it, and
 nothing enforces that the two stay in sync — `sql/03_jobs_latest_view.sql` had
@@ -707,6 +780,13 @@ and the local snapshot — and `sql/` describes both only for as long as nobody
 changes one of them. They are identical today because one was dumped into the
 other. Nothing keeps them that way.
 
+**`UNKNOWN_FIELD` makes tool-schema changes a breaking change.** Any key in the
+model's output not in the validator's field list dead-letters the row. So adding
+a field to the tool schema dead-letters every row until the Code node is
+re-pasted with a validator that knows about it. This is deliberate — a loud
+failure beats a field silently vanishing — but schema changes have to be
+deployed in the right order, and the wrong order costs a run.
+
 **The schedule only runs while the container does.** n8n holds the cron
 in-process, so a daily trigger fires only if `docker compose up` is still
 running at the time. Uptime is the laptop's uptime. Close the lid overnight and
@@ -719,73 +799,6 @@ public and always reachable, so it now looks like a running system whether or
 not anything is ingesting. "Time since last run that produced data" measures
 laptop uptime as much as pipeline health, and a stale value there usually means
 the machine was off rather than that something broke.
-
-**`validate.js` is hand-pasted into the n8n Code node.** The file in this repo
-is the source of truth for the logic. The copy running in the canvas is a
-deployed duplicate. There is no import path from the canvas into this repo, so
-the two can drift. When the validator changes, the Code node has to be
-re-pasted, and nothing enforces that. Passing tests here are not evidence that
-the deployed copy matches.
-
-**Every error is fatal to the row.** A single bad salary discards a perfectly
-good title, company, and tech stack. Production would need severity levels, so a
-plausibility failure nulls one field while the rest of the row still lands. The
-current design is all-or-nothing because it is easier to reason about and
-because `dead_letter_log` keeps the raw output, so nothing is lost — but it does
-mean `jobs_extracted` under-counts.
-
-**The validator is coupled to Anthropic's response shape by design.** It reaches
-into `extracted.content[]` looking for a `tool_use` block. Changing model
-providers means changing the validator, not just a credential. That coupling
-buys the `model` provenance value and the `TOOL_USE_MISSING` check, and it was
-chosen deliberately, but it is coupling.
-
-**Fixtures pair positionally.** `fixtures/extraction-output.json` carries no
-`source_job_id`, so the only join key between it and
-`fixtures/source-records.json` is array index. Reordering or partially
-re-capturing one file would silently validate one job's extraction against
-another job's description. The tests assert the two arrays are the same length
-so a reorder fails loudly, but equal length is not the same as correct
-alignment.
-
-**`UNKNOWN_FIELD` makes tool-schema changes a breaking change.** Any key in the
-model's output not in the validator's field list dead-letters the row. So adding
-a field to the tool schema dead-letters every row until the Code node is
-re-pasted with a validator that knows about it. This is deliberate — a loud
-failure beats a field silently vanishing — but schema changes have to be
-deployed in the right order, and the wrong order costs a run.
-
-**`tech_stack` and `error_codes` are `jsonb`, not `text[]`.** n8n's Postgres
-node maps a JS array to json, not to a native Postgres array type, so a
-`text[]` column rejects the insert. The cost is that the natural array
-operations are not available: containment is `error_codes @> '["CODE"]'` rather
-than `'CODE' = ANY(error_codes)`, and `tech_stack` needs
-`jsonb_array_elements_text` to unnest for a tech-frequency chart. Either column
-would be a native array if the write path allowed it.
-
-**`dead_letter_log.description` is empty in every row, and the fix is
-unverified.** The validator emits the field as `description_clean`; the column
-is named `description`. An Edit Fields node now maps one to the other — see
-`docs/n8n-notes.md` — but every row currently in the table predates it and still
-has `description IS NULL`. Nothing has failed validation since, so no row
-demonstrates the mapping working. Renaming one side so they match outright would
-be cleaner than a mapping node.
-
-**`errors_json` is double-encoded.** The validator stringifies it before
-insert, so it lands in the `jsonb` column as a JSON *string* rather than an
-array. Querying it means unwrapping with `#>> '{}'` and then parsing a second
-time. `error_codes` and `raw_output` land as a proper array and object, so the
-three are inconsistent with each other.
-
-**`ingested_at` has two different types.** `timestamp` in `jobs_extracted`,
-`timestamptz` in `dead_letter_log`. The same ISO-8601 string is written to both
-and one drops the offset. Joining or comparing the two tables on time will not
-behave until they agree.
-
-**`EXTRACTION_VERSION` is defined in two places and they disagree.**
-`validate.js` hardcodes `'1.0.0'`, which is what reaches the rows.
-`.env.example` documents `EXTRACTION_VERSION=v1`, which is not wired to
-anything.
 
 **The API has open CORS and no rate limiting.** `allow_origins=["*"]`, so any
 site can call it from a browser, and there is nothing throttling requests. It
@@ -804,16 +817,106 @@ has with the n8n Code node, at smaller scale, and nothing enforces that the two
 stay in sync. Loading the `.sql` file at import and splitting it would remove
 the duplication, at the cost of a fragile split on `;`.
 
+### Accepted trade-offs
+
+These are deliberate decisions with known costs, not defects. Each was argued through, and each would be worth revisiting at a larger scale than this project has.
+
+**Every error is fatal to the row.** A single bad salary discards a perfectly
+good title, company, and tech stack. Production would need severity levels, so a
+plausibility failure nulls one field while the rest of the row still lands. The
+current design is all-or-nothing because it is easier to reason about and
+because `dead_letter_log` keeps the raw output, so nothing is lost — but it does
+mean `jobs_extracted` under-counts.
+
+**The validator is coupled to Anthropic's response shape by design.** It reaches
+into `extracted.content[]` looking for a `tool_use` block. Changing model
+providers means changing the validator, not just a credential. That coupling
+buys the `model` provenance value and the `TOOL_USE_MISSING` check, and it was
+chosen deliberately, but it is coupling.
+
+**`tech_stack` and `error_codes` are `jsonb`, not `text[]`.** n8n's Postgres
+node maps a JS array to json, not to a native Postgres array type, so a
+`text[]` column rejects the insert. The cost is that the natural array
+operations are not available: containment is `error_codes @> '["CODE"]'` rather
+than `'CODE' = ANY(error_codes)`, and `tech_stack` needs
+`jsonb_array_elements_text` to unnest for a tech-frequency chart. Either column
+would be a native array if the write path allowed it.
+
 **`dead_letter_log` has no index beyond its primary key.** It is most usefully
 queried by `ingested_at` and by `error_codes` containment, and neither is
 indexed. `jobs_extracted` has the index its view needs. At this row count none
 of it matters. It would.
 
+### Known bugs
+
+Unlike everything above, these are defects rather than trade-offs: the write
+path emits something the schema did not intend. Both are in `dead_letter_log`.
+
+**`dead_letter_log.description` is empty in every row, and the fix is
+unverified.** The validator emits the field as `description_clean`; the column
+is named `description`. An Edit Fields node now maps one to the other — see
+`docs/n8n-notes.md` — but every row currently in the table predates it and still
+has `description IS NULL`. Nothing has failed validation since, so no row
+demonstrates the mapping working.
+
+The mapping node is the wrong fix. **Rename the column to `description_clean`
+and delete the Edit Fields node.** That makes the validator's output and the
+table agree by name, so there is no translation step to get wrong, to forget
+when the field changes, or to re-verify. A mapping node is a second place the
+schema is written down, and the current bug exists precisely because two places
+disagreed.
+
+**`errors_json` is double-encoded.** The validator stringifies it before
+insert, so it lands in the `jsonb` column as a JSON *string* rather than an
+array. Querying it means unwrapping with `#>> '{}'` and then parsing a second
+time. `error_codes` and `raw_output` land as a proper array and object, so the
+three are inconsistent with each other.
+
 ## Not yet built
 
-- **The Remotive `publication_date` column.** It is in the source records and
-  it belongs in `jobs_extracted`, because first-posted and first-seen are
-  different dates. The validator does not emit it yet.
-- **The Error Trigger workflow.** Infra failures — timeouts, non-2xx responses,
-  API outages — are uncaught. The design calls for a separate n8n Error Trigger
-  workflow, kept distinct from data validation failures.
+Two things, in priority order.
+
+### 1. The Error Trigger workflow
+
+**The dashboard is blind to pipeline liveness, and this is what would fix it.**
+
+Every metric on the page is derived from rows that were written. A run that dies
+before either Postgres node executes — a timeout, a non-2xx from Anthropic, an
+API outage, a container that was never up — writes nothing to either table, so
+it is not a run at all as far as the dashboard is concerned. The recent-runs
+table stays clean through an outage. The only signal is "time since last run
+that produced data" going stale, which is indistinguishable from the laptop
+having been closed.
+
+That is the largest gap in the project. A pipeline-monitoring dashboard that
+cannot see the pipeline failing is monitoring its own output, not the pipeline.
+
+The design has always called for this to be separate from validation failures,
+and it should stay separate: an HTTP 529 from Anthropic and a model returning a
+bad `seniority` value are different events with different fixes, and mixing them
+into one table makes both harder to diagnose.
+
+**Most of the work is done.** `pipeline_errors` already exists in the warehouse,
+with its sequence and primary key, migrated to Neon along with everything else.
+It has zero rows because nothing writes to it yet. What remains is one n8n Error
+Trigger workflow and a Postgres node pointed at that table — then a sixth
+endpoint and a panel, at which point the dashboard can distinguish "no runs
+because nothing was scheduled" from "no runs because every run died".
+
+### 2. The Remotive `publication_date` column
+
+**The volume chart currently measures when the pipeline ran, not when the market
+moved.**
+
+First-posted and first-seen are different dates, and only one of them is in the
+warehouse. `ingested_at` records when this pipeline observed a posting, which is
+a fact about the schedule — and about laptop uptime. `publication_date` records
+when the posting went up, which is a fact about the job market. Right now a
+ten-day gap in the ingestion chart says the machine was off; it cannot say
+whether hiring paused.
+
+The field is already in the Remotive records and in
+`validator/fixtures/source-records.json`. It is not emitted by `validate.js` and
+not in either table. Adding it is a change to the validator's record shape plus
+the test that asserts that shape, plus a column on `jobs_extracted` — small, but
+it touches the validator contract, which is why it is second rather than first.
