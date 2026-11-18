@@ -42,6 +42,7 @@
     --series-3: #1baf7a;
     --series-4: #eda100;
     --series-5: #e87ba4;
+    --series-6: #7a5fd0;
 
     --good:     #0ca30c;
     --warning:  #fab219;
@@ -65,6 +66,7 @@
       --series-3: #199e70;
       --series-4: #c98500;
       --series-5: #d55181;
+      --series-6: #9580e0;
 
       --good-ink: #0ca30c;
     }
@@ -84,6 +86,7 @@
     --series-3: #199e70;
     --series-4: #c98500;
     --series-5: #d55181;
+    --series-6: #9580e0;
     --good-ink: #0ca30c;
   }
 
@@ -204,6 +207,43 @@
   .status.failed   { color: var(--critical); }
   .status.degraded .g { color: var(--warning); }
 
+  /* Pipeline health and run state. Deliberately not .status: that class is
+     data quality, and "degraded" and "failed" mean something else there. */
+  .band { font-size: 11.5px; letter-spacing: 0.06em; text-transform: uppercase;
+          color: var(--ink-muted); margin: 26px 0 10px; display: flex; gap: 10px;
+          align-items: baseline; flex-wrap: wrap; }
+  .band b { color: var(--ink-2); font-weight: 600; }
+  .band span { text-transform: none; letter-spacing: 0; font-size: 12px; }
+
+  .phead { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  .phealth { display: inline-flex; align-items: center; gap: 8px; font-size: 15px;
+             font-weight: 600; padding: 6px 14px; border-radius: 999px;
+             border: 1px solid var(--hairline); background: var(--plane); }
+  .phealth .g { font-size: 12px; line-height: 1; }
+  .phealth.healthy  { color: var(--good-ink); border-color: var(--good); }
+  .phealth.degraded { color: var(--ink); border-color: var(--warning); }
+  .phealth.degraded .g { color: var(--warning); }
+  .phealth.failed   { color: var(--critical); border-color: var(--critical); }
+  .phealth.no_data, .phealth.unknown { color: var(--ink-2); border-style: dashed; }
+  .psummary { font-size: 13px; color: var(--ink-2); }
+  ul.reasons { margin: 12px 0 0; padding: 0; list-style: none; font-size: 12.5px;
+               color: var(--ink-2); }
+  ul.reasons li { padding: 4px 0; }
+  ul.reasons code, td code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+               font-size: 11.5px; color: var(--ink-muted); margin-right: 6px; }
+  td code { margin: 0 0 0 6px; }
+  .strip.tight { margin: 16px 0 0; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+  .strip.tight .tile { background: var(--plane); min-height: 92px; }
+  .strip.tight .tile .v { font-size: 20px; }
+
+  .rstate { display: inline-flex; align-items: center; gap: 6px; }
+  .rstate .g { font-size: 11px; line-height: 1; }
+  .rstate.completed { color: var(--good-ink); }
+  .rstate.failed    { color: var(--critical); }
+  .rstate.running   { color: var(--ink-2); }
+  .rstate.stale     { color: var(--ink-2); }
+  .rstate.stale .g  { color: var(--warning); font-weight: 700; }
+
   .swatch { display: inline-block; width: 9px; height: 9px; border-radius: 2px;
             margin-right: 7px; vertical-align: -1px; }
 
@@ -225,9 +265,8 @@
     <div>
       <h1>RoleRadar pipeline metrics</h1>
       <p class="sub">
-        Ingestion and extraction quality per n8n run, over the Postgres warehouse.
-        A run is a gap-delimited cluster of rows across <code>jobs_extracted</code>
-        and <code>dead_letter_log</code>.
+        Two questions, answered separately: did the pipeline run, and were the
+        rows it wrote any good. Over the Postgres warehouse.
       </p>
     </div>
     <div class="controls">
@@ -242,6 +281,22 @@
       <span class="pill" id="health"><span class="dot"></span><span id="health-text">checking…</span></span>
     </div>
   </header>
+
+  <div class="band"><b>Pipeline health</b><span>Did the run happen and finish. Not a judgement of the data.</span></div>
+
+  <section class="card" id="pipeline-card">
+    <div class="state" id="s-pstatus"></div>
+    <div id="pstatus-body" class="hidden">
+      <div class="phead">
+        <span id="p-badge"></span>
+        <span class="psummary" id="p-summary"></span>
+      </div>
+      <div id="p-reasons"></div>
+      <div class="strip tight" id="p-tiles"></div>
+    </div>
+  </section>
+
+  <div class="band"><b>Data quality</b><span>Of the rows that arrived, how many were good. Counts rows, so a run that wrote nothing is invisible here.</span></div>
 
   <!-- Summary strip -->
   <section class="strip" id="strip">
@@ -333,11 +388,48 @@
   <section class="card">
     <div class="card-head"><h2>Recent runs</h2></div>
     <p class="desc">
-      Newest first. Δ is the change in success rate from the previous run.
+      Newest first. Δ is the change in success rate from the previous run. A run
+      here is a group of rows: by run id where the rows carry one, by timestamp
+      gap for rows written before run tracking.
     </p>
     <div class="state" id="s-runs"></div>
     <div class="tablewrap" id="runs-table-wrap"></div>
   </section>
+
+  <div class="band"><b>Executions</b><span>Every tracked run, including ones that wrote nothing or died.</span></div>
+
+  <!-- Full width: nine columns do not fit half a row. -->
+  <section class="card" style="margin-bottom:16px">
+    <div class="card-head"><h2>Recent executions</h2></div>
+    <p class="desc">
+      Newest first. <b>Accepted</b> and <b>Rejected</b> are the validator's verdicts,
+      stored when the run closed. <b>Rows written</b> is counted from the tables now.
+      They are blank on a run that never closed.
+    </p>
+    <div class="state" id="s-pruns"></div>
+    <div class="tablewrap" id="pruns-table-wrap"></div>
+  </section>
+
+  <div class="row">
+    <section class="card">
+      <div class="card-head"><h2>Execution duration</h2></div>
+      <p class="desc">Seconds from start to completion, completed runs only.</p>
+      <div class="plot short"><canvas id="c-duration"></canvas></div>
+      <div class="state" id="s-duration"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>Infrastructure errors</h2></div>
+      <p class="desc">
+        Failures of the pipeline itself: a request that did not answer, a write that
+        did not land. Not rejected rows; those are above. Category and node only.
+        Messages are not public.
+      </p>
+      <div class="state" id="s-perrors"></div>
+      <div class="tablewrap" id="pcat-table-wrap"></div>
+      <div class="tablewrap" id="perrors-table-wrap" style="margin-top:14px"></div>
+    </section>
+  </div>
 
   <footer>
     <p><b>Ingested</b> means processed, not available. It counts what the pipeline put
@@ -345,15 +437,23 @@
     <p><b>Rejection reasons</b> count rows by default: how many postings carry the code.
     Occurrences counts entries in <code>errors_json</code>, so one row with three bad
     enums counts three times. The two differ and the toggle says which is on screen.</p>
-    <p><b>This page cannot see infra failures.</b> A run that died before writing to
-    Postgres leaves no rows, so it is not a run here at all. The recent-runs table will
-    look clean through an outage; a stale "since last run that produced data" is the
-    only signal.</p>
+    <p><b>Pipeline health and data quality are different things.</b> Health is whether
+    a run happened and finished: healthy, degraded, failed, or no data. Quality is
+    whether the rows it wrote passed validation: ok, degraded, failed. A run can
+    finish perfectly and reject every row, or die having written five good ones.</p>
+    <p><b>What this page still cannot see.</b> A run that never started. If the
+    scheduler is off nothing is written, so the only sign is the last completed run
+    getting old, which pipeline health reports as failed. Runs from before run
+    tracking appear under data quality only; no execution record was invented for them.</p>
   </footer>
 </div>
 
+<script src="pipeline.js"></script>
 <script>
 "use strict";
+
+/* Pure view functions for the pipeline-health sections. See pipeline.js. */
+const P = window.RoleRadarPipeline;
 
 /* Where the API lives. Empty string = same origin, which is what happens when
    FastAPI serves this file. Set it to e.g. "http://10.0.0.4:8000" when nginx
@@ -372,6 +472,7 @@ function theme() {
   return {
     s1: cssVar("--series-1"), s2: cssVar("--series-2"), s3: cssVar("--series-3"),
     s4: cssVar("--series-4"), s5: cssVar("--series-5"),
+    s6: cssVar("--series-6"),
     ink: cssVar("--ink"), ink2: cssVar("--ink-2"), muted: cssVar("--ink-muted"),
     grid: cssVar("--grid"), axis: cssVar("--axis"), surface: cssVar("--surface"),
   };
@@ -385,6 +486,7 @@ const CATEGORY_SLOT = {
   salary_logic: "s3",
   provenance: "s4",
   envelope: "s5",
+  validator_internal: "s6",
 };
 
 /* ------------------------------------------------------------------ *
@@ -464,7 +566,8 @@ function clearState(panelId) {
  * once rather than reported as "down". A suspended database and a
  * dead one are different facts and the page has to tell them apart.
  * ------------------------------------------------------------------ */
-const PANELS = ["volume", "rate", "errors", "model", "runs"];
+const PANELS = ["volume", "rate", "errors", "model", "runs",
+                "pstatus", "pruns", "duration", "perrors"];
 const WAKE_AFTER_MS = 1400;
 const WAKING_MSG = "Waking the database\u2026";
 const WAKING_HINT =
@@ -525,7 +628,11 @@ async function getJSON(path, retried) {
       await new Promise(r => setTimeout(r, 2500));
       return getJSON(path, true);
     }
-    throw new Error(`${path} returned ${res.status} — ${detail}`);
+    const err = new Error(`${path} returned ${res.status} — ${detail}`);
+    /* The API's reason code, when it sent one. Lets a panel tell "the database
+       has not been migrated yet" from "the database is down". */
+    err.reason = body && body.reason ? body.reason : null;
+    throw err;
   }
   return body;
 }
@@ -634,7 +741,7 @@ function line(color, label, extra) {
 /* ------------------------------------------------------------------ *
  * Panels
  * ------------------------------------------------------------------ */
-const state = { runs: [], errors: null, volMode: "per_run", errMetric: "rows" };
+const state = { runs: [], errors: null, volMode: "per_run", errMetric: "rows", pruns: [] };
 
 function renderVolume() {
   destroy("volume");
@@ -818,7 +925,7 @@ function renderRunsTable() {
     <table>
       <thead><tr>
         <th>Run started</th><th>In</th><th>Validated</th><th>Rejected</th>
-        <th>Success</th><th>Δ</th><th>Status</th>
+        <th>Success</th><th>Δ</th><th>Data quality</th>
       </tr></thead>
       <tbody>${runs.map(r => {
         const d = r.success_rate_delta;
@@ -970,6 +1077,120 @@ async function loadModel() {
   }
 }
 
+/* ------------------------------------------------------------------ *
+ * Pipeline health. Three endpoints, three panels, failing separately.
+ *
+ * One extra state beyond the four: "not set up". Before the database is
+ * migrated the pipeline tables do not exist, the API says so with
+ * reason=schema_outdated, and the honest thing to draw is neither an
+ * error nor an empty result.
+ * ------------------------------------------------------------------ */
+const NOT_SET_UP = "Run tracking is not set up in this database yet.";
+const NOT_SET_UP_HINT =
+  "The pipeline tables have not been created. Data quality below is unaffected.";
+
+function pipelineFailure(panel, e) {
+  if (e.reason === "schema_outdated") setState(panel, "empty", NOT_SET_UP, NOT_SET_UP_HINT);
+  else setState(panel, "error", e.message);
+}
+
+function renderPipelineStatus(d) {
+  const view = P.healthView(d);
+  document.getElementById("p-badge").innerHTML = P.healthBadgeHTML(view);
+  document.getElementById("p-summary").textContent = view.summary;
+  document.getElementById("p-reasons").innerHTML = P.reasonsHTML(view);
+  document.getElementById("p-tiles").innerHTML = P.tiles(d).map(t => `
+    <div class="tile">
+      <div class="k">${P.esc(t.label)}</div>
+      <div class="v">${P.esc(t.value)}</div>
+      <div class="n${t.warn ? " warnish" : ""}">${P.esc(t.note)}</div>
+    </div>`).join("");
+}
+
+function renderErrorCategories(d) {
+  document.getElementById("pcat-table-wrap").innerHTML = P.errorCategoriesHTML(d);
+}
+
+async function loadPipelineStatus() {
+  const body = document.getElementById("pstatus-body");
+  try {
+    const d = await getJSON("/api/pipeline-status");
+    clearState("pstatus");
+    body.classList.remove("hidden");
+    renderPipelineStatus(d);
+    renderErrorCategories(d);
+  } catch (e) {
+    body.classList.add("hidden");
+    document.getElementById("pcat-table-wrap").innerHTML = "";
+    pipelineFailure("pstatus", e);
+  }
+}
+
+function renderDuration() {
+  destroy("duration");
+  const t = theme();
+  const series = P.durationSeries(state.pruns);
+  if (!series.seconds.length) {
+    setState("duration", "empty", "No completed run to time.",
+      "Duration is measured from start to completion, so a run that did not complete has none.");
+    return;
+  }
+  clearState("duration");
+  const opts = baseOptions(t, "seconds", v => P.fmtDuration(v));
+  opts.plugins.legend.display = false;
+  opts.plugins.endLabels = { enabled: false };
+  charts.duration = new Chart(document.getElementById("c-duration"), {
+    type: "line",
+    data: { labels: series.labels,
+            datasets: [Object.assign(line(t.s1, "Duration"), { data: series.seconds })] },
+    options: opts,
+  });
+}
+
+async function loadPipelineRuns() {
+  const wrap = document.getElementById("pruns-table-wrap");
+  try {
+    const d = await getJSON("/api/pipeline-runs?limit=20");
+    state.pruns = d.runs;
+    if (!d.row_count) {
+      wrap.innerHTML = "";
+      destroy("duration");
+      const msg = "No tracked execution yet.";
+      const hint = "pipeline_runs is empty. Rows written before run tracking are under data quality, and no execution was invented for them.";
+      setState("pruns", "empty", msg, hint);
+      setState("duration", "empty", msg);
+      return;
+    }
+    clearState("pruns");
+    wrap.innerHTML = P.runsTableHTML(d.runs);
+    renderDuration();
+  } catch (e) {
+    state.pruns = [];
+    wrap.innerHTML = "";
+    destroy("duration");
+    pipelineFailure("pruns", e);
+    pipelineFailure("duration", e);
+  }
+}
+
+async function loadPipelineErrors() {
+  const wrap = document.getElementById("perrors-table-wrap");
+  try {
+    const d = await getJSON("/api/pipeline-errors?limit=10");
+    if (!d.row_count) {
+      wrap.innerHTML = "";
+      setState("perrors", "empty", "No infrastructure error recorded.",
+        "This means none was recorded, not that none happened. Errors are written by the n8n error workflow, and only if it is attached and could reach the database.");
+      return;
+    }
+    clearState("perrors");
+    wrap.innerHTML = P.errorsTableHTML(d.errors);
+  } catch (e) {
+    wrap.innerHTML = "";
+    pipelineFailure("perrors", e);
+  }
+}
+
 async function loadAll(isRefresh) {
   const limit = document.getElementById("limit").value;
   /* On a refresh, hold the previous render at reduced opacity rather than
@@ -981,7 +1202,8 @@ async function loadAll(isRefresh) {
     beginLoading();
   }
   try {
-    await Promise.all([loadHealth(), loadRuns(limit), loadSummary(), loadErrors(), loadModel()]);
+    await Promise.all([loadHealth(), loadRuns(limit), loadSummary(), loadErrors(), loadModel(),
+                       loadPipelineStatus(), loadPipelineRuns(), loadPipelineErrors()]);
   } finally {
     endLoading();
     document.querySelectorAll(".card, .strip").forEach(el => el.classList.remove("stale"));
@@ -1015,6 +1237,7 @@ document.querySelectorAll("[data-err]").forEach(b => {
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
   if (state.runs.length) { renderVolume(); renderRate(); }
   if (state.errors) renderErrors();
+  if (state.pruns.length) renderDuration();
   loadModel();
 });
 
