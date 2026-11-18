@@ -50,7 +50,11 @@ non-2xx responses, API outages. This is deliberately distinct from data
 validation failures. An HTTP 529 from Anthropic is not the same event as a model
 returning a bad `seniority` value, and mixing them makes both un-diagnosable.
 
-Downstream: Postgres -> FastAPI (`/stats`, `/jobs`) -> Chart.js page.
+Downstream: Postgres -> FastAPI (`/api/*`) -> Chart.js page.
+
+The run-aware version of this flow, with `Start Run` and `Complete Run` nodes
+around it and the Error Trigger workflow beside it, is specified in
+`docs/n8n-notes.md` and is not built. See decision (d).
 
 ## Extraction schema
 
@@ -94,8 +98,8 @@ These were argued through and settled. Do not quietly revisit them.
 
 ### (a) jobs_extracted is append-only
 
-Every run inserts. Nothing is updated or deleted. Current state comes from a view
-in `sql/03_jobs_latest_view.sql`:
+Every run inserts. Nothing is updated or deleted. Current state comes from the
+`jobs_latest` view, defined in `sql/migrations/`:
 
 ```sql
 QUALIFY ROW_NUMBER() OVER (
@@ -144,17 +148,15 @@ ten schema fields become eleven columns, because `mentions_n8n` splits into
 **Why:** without these, a row cannot be traced back to the posting it came from,
 and a dead-letter row is an error message attached to nothing. `model` and
 `extraction_version` mean rows stay comparable after the prompt or tool schema
-changes. `extraction_version` currently has two conflicting definitions:
-`validate.js` hardcodes `'1.0.0'` and `.env.example` documents
-`EXTRACTION_VERSION=v1`, which is not wired to anything. Reconcile before
-writing rows anywhere permanent.
+changes. `extraction_version` has one definition: the
+`EXTRACTION_VERSION` constant in `validate.js`. Nothing else sets it.
 
-**`publication_date` is not yet emitted by the validator.** It is in the
-Remotive records and in `validator/fixtures/source-records.json`, and it belongs
-here because first-posted and first-seen are different dates and the
-postings-over-time chart needs to distinguish them. `validate.js` does not put
-it on either record yet, and `validate.test.js` asserts the exact record shape,
-so adding it is a code change plus a test change. Open item.
+**`publication_date` is emitted by `validateBatch()`, not by `validate()`.** It
+belongs here because first-posted and first-seen are different dates and the
+postings-over-time chart needs to distinguish them. `validate()` and its tests
+were left exactly as they were; the batch function adds the field, along with
+`run_id`. It is stored as Remotive sent it, with no zone, and is NULL when
+missing or malformed. A bad date never dead-letters a row. Not deployed yet.
 
 **`source_job_id` type: resolved.** Remotive returns it as a number.
 `validate.js` coerces it to a string on the record, so the column type does not
@@ -174,7 +176,17 @@ description.
 ```js
 validate({ source, extracted }, ingestedAt) -> { valid, errors, record }
 // errors: [{ field, code, message }]
+
+validateBatch(pairs, ingestedAt, runId) -> {
+  run_id, ingested_at, extraction_version,
+  records_processed, records_accepted, records_rejected,
+  accepted_records, rejected_records, warnings
+}
 ```
+
+`validateBatch` calls `validate` once per pair and holds no rules of its own.
+Its counts are the validator's verdicts, never rows written. Do not present
+them as database counts.
 
 `source` and `extracted` stay separate and are never flattened. Flattening loses
 the distinction between what the API gave us and what the model produced, which
@@ -221,15 +233,95 @@ equal there by construction. That is deliberate. The disagreements live in
 version. Keeping both columns in the main table means the join is not needed to
 sanity-check the invariant.
 
+### (d) A run is closed by the database, and health is not quality
+
+`pipeline_runs` has one row per execution: `running`, then `completed` or
+`failed`. Two functions in migration `0009` own those transitions.
+
+`complete_pipeline_run(run_id, fetched, submitted, accepted_ids, rejected_ids)`
+closes a run only when the counts, the id lists and the rows all agree. It
+cannot see what the validator did, so it is told the same fact from several
+nodes and refuses when they disagree: fetched from the source request,
+submitted from `Prep`, the lists from the validator, the rows from the
+tables. If anything is off it raises and changes nothing.
+
+Each of those numbers must keep coming from a different node. A version that
+checked only "every listed id has a row" accepted two empty lists from a
+completion node that ran too early, and marked an unwritten run complete. Do
+not simplify the canvas expression so that one node supplies everything.
+
+**Why:** the first design closed the run with a plain UPDATE in a node that
+had to be drawn lowest on the canvas so it ran last. Drawn wrong, it marked a
+run complete before anything was written, and nothing could tell. Now the
+position still decides when the node runs, but a node that runs too early
+fails the run instead of mislabelling it. A rule that lived in the layout of
+a canvas became a rule in tested SQL.
+
+**Rejected:** doing the inserts and the close in one SQL statement. It is
+atomic, which this is not. It also replaces the hand-built insert nodes with a
+long hand-written statement in the canvas, against decision (a)'s secondary
+reason.
+
+`record_pipeline_error(...)` is what the Error Trigger workflow calls. It
+finds the run by execution id, workflow id and recency together, never by
+execution id alone, because n8n recycles execution ids when its volume is
+recreated. It marks only that run failed, only if it is still `running`.
+
+**Two status words, never merged.** `ok / degraded / failed` on `/api/runs` is
+data quality: were the rows good. `healthy / degraded / failed / no_data` on
+`/api/pipeline-status` is pipeline health: did the run happen. Do not fold one
+into the other or reuse one's field name for the other.
+
+**Silence is failure.** A stopped scheduler writes nothing. A stale last
+completed run is `failed`, not `healthy`. Do not claim the Error Trigger
+detects a run that never started; only `monitor/check_freshness.py` can.
+
+**Tests of the error path are simulations.** They write failure rows by
+calling the function. Never present them as proof that n8n's Error Trigger
+works.
+
+### (e) The public gets summaries; diagnostics stay with the operator
+
+The API has no login. Publicly it returns counts, statuses, error categories
+and node names. Error messages, execution ids and workflow names are returned
+only to a caller sending `X-Ops-Token` equal to `OPS_TOKEN`, and are redacted
+even then. With `OPS_TOKEN` unset there is no operator mode at all.
+
+A database driver's message is never returned. Clients get a `reason` code and
+a fixed sentence from `PUBLIC_DETAIL`; the real text goes to the
+`roleradar.api` log after redaction. The `waking` sentence is matched by the
+dashboard, so change both or neither.
+
+**Why one token and not real auth:** there is one reader of diagnostics, and
+they use curl. Users and sessions would be more code to get wrong than the
+thing being protected.
+
+**Why no message publicly, not a redacted one:** redaction is by pattern and
+misses whatever nobody anticipated. Not sending the text cannot miss.
+
+The API's pooled connections are read-only (`BEGIN READ ONLY` per
+transaction), so a preview deployment holding the production `DATABASE_URL`
+still cannot write. Do not add a write path to the API.
+
+Keys never differ between public and operator responses; withheld fields are
+null. Do not add a field to a public response without deciding which side of
+this line it is on.
+
+`validator_internal` is the error-class category for `VALIDATOR_EXCEPTION`.
+It is this project's bug, not the model's, and must not be counted under
+`schema`.
+
 ## Division of labour
 
 **Claude owns the repo:** validator and its tests, docker-compose for n8n and
 Postgres, Postgres DDL, FastAPI dashboard, Chart.js frontend, README, this file.
 
-**The owner owns:** building the n8n workflow by hand in the canvas, and running
-the DDL against the database. Tables were created by hand in `psql`, so the
-files in `sql/` document the live schema rather than create it. Nothing enforces
-that they stay in sync.
+**The owner owns:** building the n8n workflow by hand in the canvas, and
+deciding when a migration is applied to a real database, and everything in
+`docs/release-runbook.md`: backups, Neon, Vercel, pushing to `main`. The schema is defined
+by the files in `sql/migrations/` and applied with `sql/migrate.py`. Claude
+writes migrations and runs them against the disposable test database only.
+Claude never applies one to Neon or to the local warehouse.
 
 **Do not generate n8n workflow JSON for import.** That is the part being learned.
 Naming node types and explaining why to reach for them is fine and useful. Wiring
@@ -265,27 +357,50 @@ nothing writes to BigQuery.
 ```
 CLAUDE.md              this file
 README.md              setup and run instructions
-docker-compose.yml     n8n and Postgres, at root so `docker compose up` needs no -f
+docker-compose.yml     n8n and Postgres, at root so `docker compose up` needs no -f.
+                       n8n is pinned to the version docs/n8n-notes.md was
+                       verified against. Upgrade on purpose, then re-verify.
 .env.example           documented config, no real values
 validator/
   package.json         zero dependencies, on purpose
   validate.js          the module, self-contained
-  validate.test.js     node:test
+  validate.test.js     node:test, validate()
+  validateBatch.test.js  node:test, validateBatch()
   fixtures/            captured API responses and LLM outputs
 sql/
-  01_jobs_extracted.sql
-  02_dead_letter_log.sql
-  03_jobs_latest_view.sql
+  migrate.py           migration runner. Never reads DATABASE_URL.
+  migrations/          NNNN_name.sql plus NNNN_name.down.sql. The schema.
+  queries.sql          dashboard queries, the readable copy
+  preflight.sql        read-only description of a database before migrating it
+  fingerprint.sql      read-only hash of every table and schema object. A backup
+                       is verified when source and restore fingerprints match.
+tests/
+  requirements.txt     pytest and psycopg. Test-only.
+  conftest.py          one throwaway database per test, on port 5433
+  test_*.py            migrations, the runner, validator records into Postgres,
+                       the run lifecycle functions, the API, the freshness check
+  fixtures/            the pre-migration schema, rows shaped like the live ones,
+                       and the API and its SQL frozen as last committed
+  frontend/            node:test for the dashboard. No browser, no dependencies.
+docker-compose.test.yml  disposable Postgres for tests/. tmpfs, no volume.
 api/
   requirements.txt
-  main.py              FastAPI, /stats and /jobs
-  static/              index.html, app.js, Chart.js page
+  main.py              FastAPI. Dashboard endpoints and /api/pipeline-*
+  static/              index.html (loading, charts) and pipeline.js (pure view
+                       functions for the pipeline-health sections)
+monitor/
+  check_freshness.py   external check. Standard library only. Run by
+                       .github/workflows/freshness.yml, not by n8n.
 docs/
-  n8n-notes.md         node choices and wiring rationale
+  n8n-notes.md         node choices, wiring instructions, staging verification
+  release-runbook.md   the production release, step by step. Owner runs it.
 workflows/
   *.json               exported from the n8n canvas, for the record.
                        Export only. Never hand-generated by Claude.
 ```
+
+`sql/queries.sql` and the SQL constants in `api/main.py` are two copies of the
+same text. A test fails if they differ. Change both.
 
 Top level splits by runtime, not by feature: JS, SQL, Python, prose. A feature
 split would scatter three languages into every folder for no gain at this size.
