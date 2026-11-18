@@ -1,0 +1,34 @@
+# A disposable Postgres for the test suite. Nothing else.
+#
+#   docker compose -f docker-compose.test.yml up -d --wait
+#   docker compose -f docker-compose.test.yml down
+#
+# Separate from docker-compose.yml on purpose, with its own project name, so
+# `down` here can never stop the real containers or reach their volumes.
+#
+# No volume at all: the data directory is tmpfs, so every row is gone when the
+# container stops. Bound to 127.0.0.1 on 5433, so it cannot collide with the
+# real Postgres on 5432 and is not reachable from the network.
+#
+# The password below is not a secret. It protects an empty in-memory database
+# that only this machine can reach.
+
+name: roleradar-test
+
+services:
+  postgres-test:
+    image: postgres:16
+    container_name: roleradar-pg-test
+    ports:
+      - "127.0.0.1:5433:5432"
+    environment:
+      - POSTGRES_USER=roleradar_test
+      - POSTGRES_PASSWORD=roleradar_test
+      - POSTGRES_DB=roleradar_test
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U roleradar_test -d roleradar_test"]
+      interval: 1s
+      timeout: 3s
+      retries: 30

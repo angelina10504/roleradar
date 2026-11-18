@@ -1,0 +1,6 @@
+# Test-only. Not installed on Vercel: tests/ is in .vercelignore.
+pytest==8.3.4
+psycopg[binary]==3.2.13
+# test_api.py imports api/main.py and drives it with FastAPI's test client.
+-r ../api/requirements.txt
+httpx==0.28.1

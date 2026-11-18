@@ -31,3 +31,9 @@ n8n_data/
 .env*
 !.env.example
 .sf/
+
+# Test environment for tests/
+.venv-test/
+
+# Database backups made while following docs/release-runbook.md
+*.dump
