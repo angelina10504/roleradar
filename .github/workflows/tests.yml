@@ -1,0 +1,68 @@
+# Runs every automated test on push and pull request.
+#
+# Nothing here reaches Neon, Vercel, n8n, Anthropic or Remotive. The database
+# is a Postgres service container, 16 and 18 in two parallel jobs, that exists
+# for the length of the job. No secrets are used.
+#
+# Pushing any branch runs this. On this repository, pushing any branch also
+# makes Vercel build a deployment; see docs/release-runbook.md, checkpoint 2.
+
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validator-and-dashboard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Validator
+        working-directory: validator
+        run: node --test
+      - name: Dashboard
+        run: node --test tests/frontend/*.test.js
+
+  database-api-monitor:
+    # 16 is the local warehouse in docker-compose.yml. 18 is Neon.
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["16", "18"]
+    name: database-api-monitor (postgres ${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_USER: roleradar_test
+          POSTGRES_PASSWORD: roleradar_test
+          POSTGRES_DB: roleradar_test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U roleradar_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r tests/requirements.txt
+      - run: python -m pytest tests

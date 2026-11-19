@@ -1,7 +1,11 @@
 services:
 
   n8n:
-    image: docker.n8n.io/n8nio/n8n:latest
+    # Pinned. docs/n8n-notes.md was checked against the source of this exact
+    # version: when the error workflow runs, what data it receives, that it
+    # must be published. `latest` would change that on the next pull without
+    # anyone re-reading the notes. Upgrade by editing this line on purpose.
+    image: docker.n8n.io/n8nio/n8n:2.35.7
     container_name: roleradar-n8n
     restart: unless-stopped
     ports:

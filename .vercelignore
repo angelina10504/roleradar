@@ -12,3 +12,7 @@ docker-compose.yml
 CLAUDE.md
 README.md
 .sf
+tests
+docker-compose.test.yml
+monitor
+.github

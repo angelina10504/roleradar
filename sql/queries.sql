@@ -1,7 +1,8 @@
 -- queries.sql
 --
--- Every number on the dashboard comes from one of these. One query per
--- endpoint, plus one diagnostic that is not wired to anything.
+-- Every number the API returns comes from one of these. Queries 1 to 4 are
+-- the dashboard. Query 5 is a diagnostic that is not wired to anything.
+-- Queries 6 to 8 are pipeline monitoring.
 --
 -- Aggregation happens here, not in JavaScript. The browser receives rows that
 -- are already the answer.
@@ -29,6 +30,30 @@
 -- between is noise. This is also why the ROWS UNBOUNDED PRECEDING running sum
 -- below is doing real work rather than decoration: it converts the per-row
 -- "is this a boundary" flag into a run number.
+--
+-- That is how rows written before run tracking are grouped, and it is still
+-- how they are grouped. Those rows have run_id NULL. They are never given a
+-- run_id after the fact: a guessed run recorded as a fact is worse than an
+-- honest inference made on read.
+--
+-- Rows written by the run-aware workflow carry the run_id of their
+-- pipeline_runs row, and for them there is nothing to infer. Their run is
+-- their run_id. So every run-scoped query below has two arms:
+--
+--   legacy    run_id IS NULL      grouped by gap, exactly as before
+--   explicit  run_id IS NOT NULL  grouped by run_id
+--
+-- Only legacy rows take part in the LAG. An explicit run that lands within
+-- RUN_GAP of a legacy one is therefore never merged into it, and two explicit
+-- runs seconds apart stay two runs.
+--
+-- run_key is the grouping key: 'legacy:<n>' or 'run:<uuid>'. The prefix is the
+-- point. An inferred run can never be read as a real UUID. The API returns
+-- run_source ('legacy' or 'explicit') and run_id (the UUID, or NULL).
+--
+-- On a warehouse with only legacy rows these queries return what they
+-- returned before the change. tests/test_api.py runs the old and new text
+-- side by side to hold that.
 --
 -- RUN_GAP is passed as a parameter so it is visible at the call site rather
 -- than buried. 2 minutes is the default.
@@ -67,98 +92,93 @@
 -- row_count 0 rather than as a chart of zeros.
 
 WITH events AS (
-    SELECT ingested_at                      AS ts, 1 AS validated, 0 AS rejected
+    SELECT ingested_at                    AS ts, run_id, 1 AS validated, 0 AS rejected
     FROM public.jobs_extracted
     UNION ALL
-    SELECT ingested_at AT TIME ZONE 'UTC'   AS ts, 0 AS validated, 1 AS rejected
+    SELECT ingested_at AT TIME ZONE 'UTC' AS ts, run_id, 0 AS validated, 1 AS rejected
     FROM public.dead_letter_log
 ),
 marked AS (
     SELECT
         ts, validated, rejected,
         CASE
-            WHEN LAG(ts) OVER (ORDER BY ts) IS NULL                       THEN 1
-            WHEN ts - LAG(ts) OVER (ORDER BY ts) > %(run_gap)s::interval  THEN 1
+            WHEN LAG(ts) OVER (ORDER BY ts) IS NULL                      THEN 1
+            WHEN ts - LAG(ts) OVER (ORDER BY ts) > %(run_gap)s::interval THEN 1
             ELSE 0
         END AS is_run_start
     FROM events
+    WHERE run_id IS NULL
 ),
 numbered AS (
     SELECT
         ts, validated, rejected,
-        SUM(is_run_start) OVER (ORDER BY ts ROWS UNBOUNDED PRECEDING) AS run_seq
+        'legacy:' || SUM(is_run_start) OVER (ORDER BY ts ROWS UNBOUNDED PRECEDING)
+            AS run_key,
+        NULL::uuid AS run_id,
+        'legacy'   AS run_source
     FROM marked
-),
+    UNION ALL
+    SELECT
+        ts, validated, rejected,
+        'run:' || run_id::text AS run_key,
+        run_id,
+        'explicit' AS run_source
+    FROM events
+    WHERE run_id IS NOT NULL
+)
+,
 per_run AS (
     SELECT
-        run_seq,
-        MIN(ts)          AS run_started_at,
-        MAX(ts)          AS run_ended_at,
-        COUNT(*)         AS ingested,
-        SUM(validated)   AS validated,
-        SUM(rejected)    AS rejected
+        run_key, run_id, run_source,
+        MIN(ts) AS run_started_at,
+        MAX(ts) AS run_ended_at,
+        COUNT(*) AS ingested,
+        SUM(validated) AS validated,
+        SUM(rejected) AS rejected
     FROM numbered
-    GROUP BY run_seq
+    GROUP BY run_key, run_id, run_source
 ),
 scored AS (
     SELECT
-        run_started_at,
-        run_ended_at,
-        ingested,
-        validated,
-        rejected,
+        run_key, run_id, run_source,
+        run_started_at, run_ended_at, ingested, validated, rejected,
         validated::numeric / NULLIF(ingested, 0) AS success_rate
     FROM per_run
 ),
 windowed AS (
     SELECT
+        run_key, run_id, run_source,
         run_started_at,
         run_ended_at,
         ingested,
         validated,
         rejected,
         ROUND(success_rate, 4) AS success_rate,
-        ROUND(
-            success_rate - LAG(success_rate) OVER (ORDER BY run_started_at)
-        , 4) AS success_rate_delta,
-        ROUND(
-            AVG(success_rate) OVER (
-                ORDER BY run_started_at
-                ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
-            )
-        , 4) AS success_rate_rolling3,
-        (SUM(ingested) OVER (
-            ORDER BY run_started_at ROWS UNBOUNDED PRECEDING
-        ))::bigint AS cumulative_ingested,
-        (SUM(validated) OVER (
-            ORDER BY run_started_at ROWS UNBOUNDED PRECEDING
-        ))::bigint AS cumulative_validated,
-        -- ok       nothing was rejected
-        -- degraded some rows landed, some were rejected
-        -- failed   the run processed rows and none of them validated
+        ROUND(success_rate - LAG(success_rate) OVER (ORDER BY run_started_at, run_key), 4)
+            AS success_rate_delta,
+        ROUND(AVG(success_rate) OVER (
+            ORDER BY run_started_at, run_key ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+        ), 4) AS success_rate_rolling3,
+        (SUM(ingested) OVER (ORDER BY run_started_at, run_key ROWS UNBOUNDED PRECEDING))::bigint
+            AS cumulative_ingested,
+        (SUM(validated) OVER (ORDER BY run_started_at, run_key ROWS UNBOUNDED PRECEDING))::bigint
+            AS cumulative_validated,
         CASE
             WHEN rejected = 0  THEN 'ok'
             WHEN validated = 0 THEN 'failed'
             ELSE 'degraded'
         END AS status,
-        ROW_NUMBER() OVER (ORDER BY run_started_at DESC) AS recency
+        ROW_NUMBER() OVER (ORDER BY run_started_at DESC, run_key DESC) AS recency
     FROM scored
 )
 SELECT
-    run_started_at,
-    run_ended_at,
-    ingested,
-    validated,
-    rejected,
-    success_rate,
-    success_rate_delta,
-    success_rate_rolling3,
-    cumulative_ingested,
-    cumulative_validated,
-    status
+    run_started_at, run_ended_at, ingested, validated, rejected,
+    success_rate, success_rate_delta, success_rate_rolling3,
+    cumulative_ingested, cumulative_validated, status,
+    run_source, run_id
 FROM windowed
 WHERE recency <= %(limit)s
-ORDER BY run_started_at;
+ORDER BY run_started_at, run_key;
 
 
 -- ===========================================================================
@@ -189,46 +209,65 @@ ORDER BY run_started_at;
 -- Parameters: %(run_gap)s interval.
 
 WITH events AS (
-    SELECT ingested_at                      AS ts, 1 AS validated, 0 AS rejected
+    SELECT ingested_at                    AS ts, run_id, 1 AS validated, 0 AS rejected
     FROM public.jobs_extracted
     UNION ALL
-    SELECT ingested_at AT TIME ZONE 'UTC'   AS ts, 0 AS validated, 1 AS rejected
+    SELECT ingested_at AT TIME ZONE 'UTC' AS ts, run_id, 0 AS validated, 1 AS rejected
     FROM public.dead_letter_log
 ),
 marked AS (
     SELECT
         ts, validated, rejected,
         CASE
-            WHEN LAG(ts) OVER (ORDER BY ts) IS NULL                       THEN 1
-            WHEN ts - LAG(ts) OVER (ORDER BY ts) > %(run_gap)s::interval  THEN 1
+            WHEN LAG(ts) OVER (ORDER BY ts) IS NULL                      THEN 1
+            WHEN ts - LAG(ts) OVER (ORDER BY ts) > %(run_gap)s::interval THEN 1
             ELSE 0
         END AS is_run_start
     FROM events
+    WHERE run_id IS NULL
 ),
 numbered AS (
     SELECT
         ts, validated, rejected,
-        SUM(is_run_start) OVER (ORDER BY ts ROWS UNBOUNDED PRECEDING) AS run_seq
+        'legacy:' || SUM(is_run_start) OVER (ORDER BY ts ROWS UNBOUNDED PRECEDING)
+            AS run_key,
+        NULL::uuid AS run_id,
+        'legacy'   AS run_source
     FROM marked
-),
+    UNION ALL
+    SELECT
+        ts, validated, rejected,
+        'run:' || run_id::text AS run_key,
+        run_id,
+        'explicit' AS run_source
+    FROM events
+    WHERE run_id IS NOT NULL
+)
+,
 per_run AS (
     SELECT
-        MIN(ts)        AS run_started_at,
-        COUNT(*)       AS ingested,
+        run_key,
+        MIN(ts) AS run_started_at,
+        COUNT(*) AS ingested,
         SUM(validated) AS validated,
-        SUM(rejected)  AS rejected
+        SUM(rejected) AS rejected
     FROM numbered
-    GROUP BY run_seq
+    GROUP BY run_key
+),
+last_run AS (
+    SELECT * FROM per_run
+    ORDER BY run_started_at DESC, run_key DESC
+    LIMIT 1
 ),
 agg AS (
     SELECT
-        COUNT(*)                        AS run_count,
-        COALESCE(SUM(ingested),  0)::bigint     AS total_ingested,
-        COALESCE(SUM(validated), 0)::bigint     AS total_validated,
-        COALESCE(SUM(rejected),  0)::bigint     AS total_rejected,
-        MAX(run_started_at)             AS last_run_started_at,
+        COUNT(*)                    AS run_count,
+        COALESCE(SUM(ingested),  0)::bigint AS total_ingested,
+        COALESCE(SUM(validated), 0)::bigint AS total_validated,
+        COALESCE(SUM(rejected),  0)::bigint AS total_rejected,
+        MAX(run_started_at)         AS last_run_started_at,
         MAX(run_started_at) FILTER (WHERE validated > 0)
-                                        AS last_successful_run_at
+                                    AS last_successful_run_at
     FROM per_run
 )
 SELECT
@@ -238,7 +277,6 @@ SELECT
     a.total_rejected,
     ROUND(a.total_validated::numeric / NULLIF(a.total_ingested, 0), 4)
         AS overall_success_rate,
-
     a.last_run_started_at,
     l.ingested  AS last_run_ingested,
     l.validated AS last_run_validated,
@@ -251,20 +289,29 @@ SELECT
         WHEN l.validated = 0 THEN 'failed'
         ELSE 'degraded'
     END AS last_run_status,
-
     a.last_successful_run_at,
-    -- now() is timestamptz; both sides are forced to naive UTC to match the
-    -- normalisation at the top of the query.
     EXTRACT(EPOCH FROM (
         (now() AT TIME ZONE 'UTC') - a.last_successful_run_at
     ))::bigint AS seconds_since_last_successful_run
 FROM agg a
-LEFT JOIN per_run l ON l.run_started_at = a.last_run_started_at;
+LEFT JOIN last_run l ON true;
 
 
 -- ===========================================================================
 -- 3. GET /api/error-classes
 -- ===========================================================================
+-- Categories, and what each one says went wrong:
+--   model_disagreement  the model's mentions_n8n disagreed with the regex
+--   envelope            the response had no tool_use block
+--   schema              a field the model produced has the wrong type or value
+--   salary_logic        the salary fields contradict each other
+--   provenance          a field Remotive should have supplied is missing
+--   validator_internal  validate() threw. A bug in this project's code.
+--
+-- validator_internal is matched first. Without its own branch the code
+-- VALIDATOR_EXCEPTION would fall through to 'schema' and be counted as a model
+-- mistake. No stored row carries the code, so adding the branch moved nothing.
+--
 -- Serves the error-class bar chart: rejection reasons by category.
 --
 -- Counts two different things and returns both, because they are not the same
@@ -316,6 +363,7 @@ classified AS (
         dead_letter_id,
         code,
         CASE
+            WHEN code = 'VALIDATOR_EXCEPTION' THEN 'validator_internal'
             WHEN code = 'N8N_MISMATCH'                            THEN 'model_disagreement'
             WHEN code = 'TOOL_USE_MISSING'                        THEN 'envelope'
             WHEN code IN ('SALARY_ORDER', 'SALARY_PARTIAL',
@@ -405,42 +453,253 @@ ORDER BY 1, 2;
 -- Parameters: %(run_gap)s interval.
 
 WITH events AS (
-    SELECT
-        ingested_at AS ts,
-        false       AS mismatch
+    SELECT ingested_at AS ts, run_id, false AS mismatch
     FROM public.jobs_extracted
     UNION ALL
-    SELECT
-        ingested_at AT TIME ZONE 'UTC'            AS ts,
-        error_codes @> '["N8N_MISMATCH"]'::jsonb  AS mismatch
+    SELECT ingested_at AT TIME ZONE 'UTC' AS ts, run_id,
+           error_codes @> '["N8N_MISMATCH"]'::jsonb AS mismatch
     FROM public.dead_letter_log
 ),
 marked AS (
     SELECT
         ts, mismatch,
         CASE
-            WHEN LAG(ts) OVER (ORDER BY ts) IS NULL                       THEN 1
-            WHEN ts - LAG(ts) OVER (ORDER BY ts) > %(run_gap)s::interval  THEN 1
+            WHEN LAG(ts) OVER (ORDER BY ts) IS NULL                      THEN 1
+            WHEN ts - LAG(ts) OVER (ORDER BY ts) > %(run_gap)s::interval THEN 1
             ELSE 0
         END AS is_run_start
     FROM events
+    WHERE run_id IS NULL
 ),
 numbered AS (
     SELECT
         ts, mismatch,
-        SUM(is_run_start) OVER (ORDER BY ts ROWS UNBOUNDED PRECEDING) AS run_seq
+        'legacy:' || SUM(is_run_start) OVER (ORDER BY ts ROWS UNBOUNDED PRECEDING)
+            AS run_key
     FROM marked
+    UNION ALL
+    SELECT ts, mismatch, 'run:' || run_id::text AS run_key
+    FROM events
+    WHERE run_id IS NOT NULL
 )
 SELECT
     MIN(ts)                          AS run_started_at,
     COUNT(*)                         AS processed,
     COUNT(*) FILTER (WHERE mismatch) AS mismatches,
-    ROUND(
-        COUNT(*) FILTER (WHERE mismatch)::numeric / NULLIF(COUNT(*), 0)
-    , 4) AS mismatch_rate
+    ROUND(COUNT(*) FILTER (WHERE mismatch)::numeric / NULLIF(COUNT(*), 0), 4)
+        AS mismatch_rate
 FROM numbered
-GROUP BY run_seq
-ORDER BY run_started_at;
+GROUP BY run_key
+ORDER BY run_started_at, run_key;
+
+
+-- ===========================================================================
+-- 6. GET /api/pipeline-runs
+-- ===========================================================================
+-- One row per pipeline_runs row, newest first. This is the only place a run
+-- that wrote nothing can be seen: one that fetched zero postings, or one that
+-- died before either insert.
+--
+-- Two kinds of number, deliberately side by side:
+--   *_count  what the workflow recorded when it closed the run. The
+--            validator's verdicts. NULL on a run that never closed.
+--   *_rows   counted from the tables on every read. What is actually there.
+-- A replayed insert is skipped by the unique index from migration 0004, so
+-- neither can be inflated. When they differ the difference is the finding.
+--
+-- is_stale: still 'running' after %(stale)s. A run takes seconds.
+--
+-- error_message and n8n_execution_id are returned raw by this query. The API
+-- returns neither to the public, and redacts and shortens the message for an
+-- operator. Do not paste a result of this query anywhere public.
+--
+-- Parameters: %(stale)s interval, %(status)s text or NULL, %(limit)s, %(offset)s.
+
+SELECT
+    r.run_id::text      AS run_id,
+    r.n8n_execution_id,
+    r.status,
+    (r.status = 'running'
+        AND r.started_at < now() - %(stale)s::interval) AS is_stale,
+    r.started_at,
+    r.completed_at,
+    ROUND(EXTRACT(EPOCH FROM (r.completed_at - r.started_at))::numeric, 3)
+        AS duration_seconds,
+    EXTRACT(EPOCH FROM (now() - r.started_at))::bigint AS age_seconds,
+    r.fetched_count,
+    r.processed_count,
+    r.accepted_count,
+    r.rejected_count,
+    (SELECT count(*) FROM public.jobs_extracted j WHERE j.run_id = r.run_id)
+        AS accepted_rows,
+    (SELECT count(*) FROM public.dead_letter_log d WHERE d.run_id = r.run_id)
+        AS rejected_rows,
+    r.error_category,
+    r.error_message,
+    (SELECT count(*) FROM public.pipeline_errors e WHERE e.run_id = r.run_id)
+        AS error_count
+
+FROM public.pipeline_runs r
+WHERE (%(status)s::text IS NULL OR r.status = %(status)s::text)
+ORDER BY r.started_at DESC, r.run_id
+LIMIT %(limit)s OFFSET %(offset)s;
+
+-- The total for the same filter, for pagination.
+SELECT count(*) AS total
+FROM public.pipeline_runs r
+WHERE (%(status)s::text IS NULL OR r.status = %(status)s::text);
+
+
+-- ===========================================================================
+-- 7. GET /api/pipeline-errors
+-- ===========================================================================
+-- Infra failures written by the Error Trigger workflow through
+-- record_pipeline_error() (migration 0009). Newest first. run_id is NULL when
+-- the failure could not be tied to a run, which is normal for a failure
+-- before the run row was written.
+--
+-- The API returns error_message, workflow_name and execution_id only to a
+-- caller holding the operator token. Publicly they are null.
+--
+-- Parameters: %(run_id)s uuid or NULL, %(limit)s, %(offset)s.
+
+SELECT
+    e.id,
+    e.occurred_at,
+    e.workflow_name,
+    e.failed_node,
+    e.execution_id,
+    e.run_id::text AS run_id,
+    e.error_category,
+    e.error_message
+FROM public.pipeline_errors e
+WHERE (%(run_id)s::uuid IS NULL OR e.run_id = %(run_id)s::uuid)
+ORDER BY e.occurred_at DESC, e.id DESC
+LIMIT %(limit)s OFFSET %(offset)s;
+
+SELECT count(*) AS total
+FROM public.pipeline_errors e
+WHERE (%(run_id)s::uuid IS NULL OR e.run_id = %(run_id)s::uuid);
+
+
+-- ===========================================================================
+-- 8. GET /api/pipeline-status
+-- ===========================================================================
+-- Two statements. The status word itself is decided in api/main.py by
+-- pipeline_health(), from what these return; the rules are in the README
+-- under "Pipeline health".
+--
+-- 8a: the runs the decision reads, tagged by role.
+--   last_attempt    most recently started, whatever its state
+--   last_settled    most recent run that is over: closed, or open so long it
+--                   is dead. A run in progress settles nothing.
+--   last_completed  most recent run that closed as 'completed'
+--   last_failed     most recent run that closed as 'failed'
+--   running         every open run
+--
+-- Parameters: %(stale)s interval.
+
+WITH runs AS (SELECT
+    r.run_id::text      AS run_id,
+    r.n8n_execution_id,
+    r.status,
+    (r.status = 'running'
+        AND r.started_at < now() - %(stale)s::interval) AS is_stale,
+    r.started_at,
+    r.completed_at,
+    ROUND(EXTRACT(EPOCH FROM (r.completed_at - r.started_at))::numeric, 3)
+        AS duration_seconds,
+    EXTRACT(EPOCH FROM (now() - r.started_at))::bigint AS age_seconds,
+    r.fetched_count,
+    r.processed_count,
+    r.accepted_count,
+    r.rejected_count,
+    (SELECT count(*) FROM public.jobs_extracted j WHERE j.run_id = r.run_id)
+        AS accepted_rows,
+    (SELECT count(*) FROM public.dead_letter_log d WHERE d.run_id = r.run_id)
+        AS rejected_rows,
+    r.error_category,
+    r.error_message,
+    (SELECT count(*) FROM public.pipeline_errors e WHERE e.run_id = r.run_id)
+        AS error_count
+
+    FROM public.pipeline_runs r
+)
+(SELECT 'last_attempt' AS role, x.* FROM (
+    SELECT * FROM runs ORDER BY started_at DESC, run_id LIMIT 1) x)
+UNION ALL
+(SELECT 'last_settled' AS role, x.* FROM (
+    SELECT * FROM runs WHERE status <> 'running' OR is_stale
+    ORDER BY started_at DESC, run_id LIMIT 1) x)
+UNION ALL
+(SELECT 'last_completed' AS role, x.* FROM (
+    SELECT * FROM runs WHERE status = 'completed'
+    ORDER BY completed_at DESC, run_id LIMIT 1) x)
+UNION ALL
+(SELECT 'last_failed' AS role, x.* FROM (
+    SELECT * FROM runs WHERE status = 'failed'
+    ORDER BY started_at DESC, run_id LIMIT 1) x)
+UNION ALL
+(SELECT 'running' AS role, x.* FROM (
+    SELECT * FROM runs WHERE status = 'running'
+    ORDER BY started_at DESC, run_id LIMIT 20) x);
+
+-- 8b: the counts. Always exactly one row, including on an empty warehouse.
+-- errors_since_last_completed is what separates a failure that is still the
+-- latest news from one the pipeline has recovered from.
+--
+-- Parameters: %(stale)s interval, %(window)s interval.
+
+WITH last_completed AS (
+    SELECT MAX(completed_at) AS at
+    FROM public.pipeline_runs
+    WHERE status = 'completed'
+),
+legacy AS (
+    SELECT MAX(ts) AS last_at, COUNT(*) AS n
+    FROM (
+        SELECT ingested_at AS ts
+        FROM public.jobs_extracted WHERE run_id IS NULL
+        UNION ALL
+        SELECT ingested_at AT TIME ZONE 'UTC' AS ts
+        FROM public.dead_letter_log WHERE run_id IS NULL
+    ) rows_without_a_run
+),
+recent_errors AS (
+    SELECT COALESCE(error_category, 'unknown') AS category, run_id
+    FROM public.pipeline_errors
+    WHERE occurred_at >= now() - %(window)s::interval
+)
+SELECT
+    (SELECT count(*) FROM public.pipeline_runs)   AS run_count,
+    (SELECT count(*) FROM public.pipeline_errors) AS error_count,
+    (SELECT count(*) FROM public.pipeline_runs
+      WHERE status = 'running')                   AS running_count,
+    (SELECT count(*) FROM public.pipeline_runs
+      WHERE status = 'running'
+        AND started_at < now() - %(stale)s::interval) AS stale_running_count,
+    (SELECT at FROM last_completed)               AS last_completed_at,
+    EXTRACT(EPOCH FROM (now() - (SELECT at FROM last_completed)))::bigint
+        AS seconds_since_last_completed,
+    (SELECT count(*) FROM public.pipeline_errors e
+      WHERE e.occurred_at > COALESCE((SELECT at FROM last_completed),
+                                     '-infinity'::timestamptz))
+        AS errors_since_last_completed,
+    (SELECT MAX(occurred_at) FROM public.pipeline_errors) AS last_error_at,
+    (SELECT count(*) FROM public.pipeline_runs
+      WHERE status = 'failed'
+        AND completed_at >= now() - %(window)s::interval) AS recent_failed_runs,
+    (SELECT count(*) FROM recent_errors)                  AS recent_errors,
+    (SELECT count(*) FROM recent_errors WHERE run_id IS NULL)
+        AS recent_uncorrelated_errors,
+    (SELECT jsonb_object_agg(category, n)
+       FROM (SELECT category, count(*) AS n
+             FROM recent_errors GROUP BY category) c) AS recent_errors_by_category,
+    (SELECT n FROM legacy)       AS legacy_rows,
+    (SELECT last_at FROM legacy) AS last_legacy_data_at,
+    EXTRACT(EPOCH FROM (
+        (now() AT TIME ZONE 'UTC') - (SELECT last_at FROM legacy)
+    ))::bigint AS seconds_since_last_legacy_data;
 
 
 -- ===========================================================================

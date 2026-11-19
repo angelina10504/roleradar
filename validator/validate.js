@@ -11,6 +11,11 @@
  * the bottom is guarded, so it is a no-op where `module` does not exist.
  *
  *   validate({ source, extracted }, ingestedAt) -> { valid, errors, record }
+ *   validateBatch(pairs, ingestedAt, runId)     -> counts plus both record lists
+ *
+ * validate() judges one posting. validateBatch() runs it over a whole pipeline
+ * run and stamps each record with the run id and the publication date. The
+ * Code node calls validateBatch(); see docs/n8n-notes.md.
  *
  * Pure. No clock, no I/O, no dependencies. `ingestedAt` is an argument so tests
  * are deterministic.
@@ -20,8 +25,16 @@
  * step inside the tested module rather than in the hand-pasted Code node.
  */
 
-/** Bumped when the tool schema or the checks below change. Stored per row so
- *  rows stay comparable across versions. */
+/** The one definition of the extraction version. Nothing else sets it: not
+ *  .env, not the workflow. It reaches the rows because this file is what runs
+ *  in the Code node.
+ *
+ *  Bump it when the tool schema, the prompt, or a check below changes, that
+ *  is, when the same posting could now get a different verdict or different
+ *  extracted values. Stored per row so rows stay comparable across versions.
+ *
+ *  Adding run_id and publication_date did not bump it. They are provenance
+ *  added around the verdict, and every verdict is what it was. */
 const EXTRACTION_VERSION = '1.0.0';
 
 const TOOL_NAME = 'extract_job_fields';
@@ -391,6 +404,207 @@ function validate(item, ingestedAt) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Batch
+// ---------------------------------------------------------------------------
+//
+//   validateBatch(pairs, ingestedAt, runId) -> {
+//     run_id, ingested_at, extraction_version,
+//     records_processed, records_accepted, records_rejected,
+//     accepted_records, rejected_records, warnings
+//   }
+//
+// One call per pipeline run. It calls validate() once per pair and adds the two
+// things validate() does not know about: which run this is, and when the
+// posting was published. It holds no validation rules of its own.
+//
+// Pure, like validate(). The caller reads the clock once and passes it in, so
+// every record in a run carries the same ingested_at.
+//
+// The counts are what the validator decided. They are not what the database
+// wrote: an insert can still be skipped as a duplicate or fail outright.
+
+/** What Postgres' gen_random_uuid() returns, in either case. */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** What Date.prototype.toISOString() returns. UTC is required, not assumed:
+ *  jobs_extracted.ingested_at has no zone, so a local time would be stored as
+ *  if it were UTC. */
+const UTC_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$/;
+
+/** What Remotive sends: a date-time with no offset. An offset is rejected on
+ *  purpose. The column has no zone, so Postgres would drop it without a word. */
+const NAIVE_DATETIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d{1,6})?$/;
+
+/** True for 2026-02-28, false for 2026-02-30 or an hour of 25. The regex
+ *  cannot tell those apart. Builds the instant from its parts and checks none
+ *  of them rolled over. Does not read the clock. */
+function isRealDateTime(match) {
+  const y = Number(match[1]);
+  const mo = Number(match[2]);
+  const d = Number(match[3]);
+  const h = Number(match[4]);
+  const mi = Number(match[5]);
+  const s = Number(match[6]);
+  const t = new Date(Date.UTC(y, mo - 1, d, h, mi, s));
+  return (
+    t.getUTCFullYear() === y &&
+    t.getUTCMonth() === mo - 1 &&
+    t.getUTCDate() === d &&
+    t.getUTCHours() === h &&
+    t.getUTCMinutes() === mi &&
+    t.getUTCSeconds() === s
+  );
+}
+
+/**
+ * The publication date, or null with the reason.
+ *
+ * Never fatal to the row and never guessed. publication_date is Remotive's
+ * metadata, not the model's output, and a row can be traced without it. Sending
+ * a good extraction to dead_letter_log because Remotive changed a date format
+ * would count upstream drift as model error.
+ *
+ * A usable value is passed through exactly as received.
+ */
+function readPublicationDate(source) {
+  const value = source && typeof source === 'object' ? source.publication_date : undefined;
+
+  if (value === undefined || value === null || value === '') {
+    return {
+      value: null,
+      warning: err('publication_date', 'PUBLICATION_DATE_MISSING', 'publication_date is absent; stored as null'),
+    };
+  }
+
+  const match = typeof value === 'string' ? NAIVE_DATETIME.exec(value) : null;
+  if (match === null || !isRealDateTime(match)) {
+    const shown = typeof value === 'string' ? value.slice(0, 80) : typeof value;
+    return {
+      value: null,
+      warning: err(
+        'publication_date',
+        'PUBLICATION_DATE_MALFORMED',
+        `publication_date must look like 2026-08-21T05:54:39 with no offset, got ${shown}; stored as null`
+      ),
+    };
+  }
+
+  return { value: value, warning: null };
+}
+
+/** The result for a pair validate() threw on. validate() is written not to
+ *  throw, so this is a bug being caught, not a case being handled. The pair is
+ *  dead-lettered so the other rows in the run still land, and so the counts
+ *  still add up. */
+function exceptionResult(pair, ingestedAt, error) {
+  const message = error && error.message ? String(error.message) : 'unknown error';
+  const errors = [err('validator', 'VALIDATOR_EXCEPTION', `validate() threw: ${message}`)];
+  let record;
+  try {
+    record = deadLetterRecord(pair ? pair.source : undefined, pair ? pair.extracted : undefined, ingestedAt, errors);
+  } catch (ignored) {
+    // The input is strange enough to break record-building too. Keep the
+    // failure and drop the provenance rather than lose the row.
+    record = {
+      source_job_id: null,
+      source_url: null,
+      raw_title: null,
+      raw_company: null,
+      ingested_at: ingestedAt,
+      model: null,
+      extraction_version: EXTRACTION_VERSION,
+      description_clean: null,
+      raw_output: 'null',
+      error_codes: ['VALIDATOR_EXCEPTION'],
+      errors_json: JSON.stringify(errors),
+    };
+  }
+  return { valid: false, errors: errors, record: record };
+}
+
+function validateBatch(pairs, ingestedAt, runId) {
+  // These three are wiring, not data. A bad run id is the workflow's fault, so
+  // it throws: the node fails, the run is recorded as an infra failure, and
+  // nothing is written under an id that does not exist.
+  if (!Array.isArray(pairs)) {
+    throw new TypeError(`validateBatch: pairs must be an array, got ${pairs === null ? 'null' : typeof pairs}`);
+  }
+  if (typeof ingestedAt !== 'string' || !UTC_INSTANT.test(ingestedAt) || Number.isNaN(Date.parse(ingestedAt))) {
+    throw new TypeError(
+      'validateBatch: ingestedAt must be a UTC ISO-8601 string such as 2026-08-23T12:00:00.000Z'
+    );
+  }
+  if (typeof runId !== 'string' || !UUID.test(runId)) {
+    throw new TypeError('validateBatch: runId must be a UUID string');
+  }
+
+  const accepted = [];
+  const rejected = [];
+  const warnings = [];
+
+  for (let i = 0; i < pairs.length; i++) {
+    const pair = pairs[i];
+
+    let result;
+    try {
+      result = validate(pair, ingestedAt);
+    } catch (error) {
+      result = exceptionResult(pair, ingestedAt, error);
+    }
+
+    let published;
+    try {
+      published = readPublicationDate(pair ? pair.source : undefined);
+    } catch (error) {
+      published = {
+        value: null,
+        warning: err('publication_date', 'PUBLICATION_DATE_MALFORMED', 'publication_date could not be read; stored as null'),
+      };
+    }
+    if (published.warning) {
+      warnings.push({
+        index: i,
+        source_job_id: result.record.source_job_id,
+        field: published.warning.field,
+        code: published.warning.code,
+        message: published.warning.message,
+      });
+    }
+
+    const record = Object.assign({}, result.record, {
+      publication_date: published.value,
+      run_id: runId,
+    });
+
+    // Exactly one of the two, for every input. That is what makes
+    // processed = accepted + rejected hold.
+    if (result.valid) {
+      accepted.push(record);
+    } else {
+      rejected.push(record);
+    }
+  }
+
+  return {
+    run_id: runId,
+    ingested_at: ingestedAt,
+    extraction_version: EXTRACTION_VERSION,
+    records_processed: pairs.length,
+    records_accepted: accepted.length,
+    records_rejected: rejected.length,
+    accepted_records: accepted,
+    rejected_records: rejected,
+    warnings: warnings,
+  };
+}
+
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { validate, EXTRACTION_VERSION, MAX_SALARY_SPAN_RATIO, MAX_TECH_STACK };
+  module.exports = {
+    validate,
+    validateBatch,
+    EXTRACTION_VERSION,
+    MAX_SALARY_SPAN_RATIO,
+    MAX_TECH_STACK,
+  };
 }

@@ -1,0 +1,50 @@
+# External freshness check. See README, "External freshness check".
+#
+# Does nothing until the repository variable ROLERADAR_STATUS_URL is set:
+# the job is skipped. Variables, not secrets, on purpose. The URL is a public
+# read-only endpoint and the check sends no credentials.
+#
+# Repository variables (Settings -> Secrets and variables -> Actions -> Variables):
+#   ROLERADAR_STATUS_URL     https://<host>/api/pipeline-status
+#   ROLERADAR_SCHEDULE       when n8n is scheduled to run, e.g. 06:00
+#   ROLERADAR_SCHEDULE_TZ    the zone that time is in, e.g. Asia/Kolkata
+#   ROLERADAR_GRACE_MINUTES  optional, default 90
+#
+# A failed job is the alert: GitHub emails the repository owner by its own
+# default. No other notification is configured here.
+
+name: Freshness check
+
+on:
+  schedule:
+    # Twice a day, UTC. The check knows the pipeline's schedule itself, so
+    # this only decides how soon a missed run is noticed, not what is due.
+    - cron: "17 4,16 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: freshness
+  cancel-in-progress: true
+
+jobs:
+  check:
+    if: ${{ vars.ROLERADAR_STATUS_URL != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: monitor
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check the pipeline ran
+        env:
+          ROLERADAR_STATUS_URL: ${{ vars.ROLERADAR_STATUS_URL }}
+          ROLERADAR_SCHEDULE: ${{ vars.ROLERADAR_SCHEDULE }}
+          ROLERADAR_SCHEDULE_TZ: ${{ vars.ROLERADAR_SCHEDULE_TZ }}
+          ROLERADAR_GRACE_MINUTES: ${{ vars.ROLERADAR_GRACE_MINUTES }}
+        run: python monitor/check_freshness.py
