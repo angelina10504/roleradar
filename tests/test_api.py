@@ -16,6 +16,7 @@ import uuid
 import psycopg
 import pytest
 from fastapi.testclient import TestClient
+from psycopg.conninfo import conninfo_to_dict
 
 from conftest import FIXTURES, REPO
 from test_migrations import insert_dead, insert_job
@@ -1049,6 +1050,99 @@ def test_a_late_row_after_completion_is_visible_as_a_mismatch(empty_api, empty_c
     assert got["rows_match_counts"] is False
     body = status_of(empty_api)
     assert body["pipeline_status"] == "degraded" and body["reasons"] == ["rows_do_not_match_counts"]
+
+
+# ---------------------------------------------------------------------------
+# Stale pooled connections
+# ---------------------------------------------------------------------------
+# Neon closes client connections when an idle compute suspends. A warm
+# serverless instance keeps its pool, and the pool's own idle pruning runs in
+# background threads that are frozen while the instance is idle. So the next
+# request is handed a connection the server already closed. Here the server
+# closes it on purpose, with pg_terminate_backend, which leaves the client in
+# the same state.
+
+
+def _backend_pid() -> int:
+    return main.run_query("SELECT pg_backend_pid() AS pid")[0]["pid"]
+
+
+def _close_pool_connections_server_side(conn) -> int:
+    """Terminate every session on this database except the caller's, and wait
+    until they are gone. Returns how many there were."""
+    return conn.execute(
+        "SELECT count(*) FILTER (WHERE pg_terminate_backend(pid, 5000)) "
+        "FROM pg_stat_activity "
+        "WHERE datname = current_database() AND pid <> pg_backend_pid()"
+    ).fetchone()[0]
+
+
+def _without_clock(body):
+    if isinstance(body, dict):
+        return {k: _without_clock(v) for k, v in body.items()
+                if k not in ("generated_at", "checked_at") and not k.startswith("seconds_since")}
+    if isinstance(body, list):
+        return [_without_clock(v) for v in body]
+    return body
+
+
+def test_a_healthy_pooled_connection_is_reused(api):
+    assert api.get("/api/health").status_code == 200
+    first = _backend_pid()
+    assert _backend_pid() == first
+    assert main._pool.get_stats().get("connections_lost", 0) == 0
+
+
+def test_a_connection_the_server_closed_is_replaced_before_a_query_uses_it(api, conn):
+    """The production failure: first request after an idle spell got a 503."""
+    before = api.get("/api/summary")
+    assert before.status_code == 200
+    stale_pid = _backend_pid()
+
+    assert _close_pool_connections_server_side(conn) == 1
+
+    after = api.get("/api/summary")
+    assert after.status_code == 200, after.text
+    assert _without_clock(after.json()) == _without_clock(before.json())
+    assert _backend_pid() != stale_pid
+    # The pool found it broken while checking it out, not after a query failed.
+    assert main._pool.get_stats()["connections_lost"] >= 1
+
+
+def test_every_endpoint_answers_unchanged_after_its_connection_went_stale(api, conn):
+    for path in EVERY_ENDPOINT:
+        fresh = api.get(path)
+        assert fresh.status_code == 200, path
+        _close_pool_connections_server_side(conn)
+        stale = api.get(path)
+        assert stale.status_code == 200, (path, stale.text)
+        assert _without_clock(stale.json()) == _without_clock(fresh.json()), path
+
+
+def test_a_database_that_stays_down_is_still_a_safe_503(api, conn, migrated_db, server,
+                                                        monkeypatch, caplog):
+    """The check replaces dead connections. It must not turn a database that
+    is really down into a hang, a 500 or a leaked driver message."""
+    monkeypatch.setattr(main, "DB_TIMEOUT", 2.0)
+    monkeypatch.setattr(main, "PROBE_TIMEOUT", 1.0)
+    name = conninfo_to_dict(migrated_db)["dbname"]
+    assert api.get("/api/health").status_code == 200
+    caplog.set_level("WARNING", logger="roleradar.api")
+    with psycopg.connect(server, autocommit=True) as admin:
+        admin.execute(f'ALTER DATABASE "{name}" ALLOW_CONNECTIONS false')
+        try:
+            _close_pool_connections_server_side(conn)
+            for path in ("/api/health", "/api/summary", "/api/pipeline-status"):
+                response = api.get(path)
+                body = response.json()
+                assert response.status_code == 503, path
+                assert body["reason"] == "unreachable" and body["detail"] in SAFE_DETAILS, body
+                for private in (name, "accepting connections", "terminating",
+                                "administrator", "psycopg", "127.0.0.1"):
+                    assert private not in response.text, (path, private)
+        finally:
+            admin.execute(f'ALTER DATABASE "{name}" ALLOW_CONNECTIONS true')
+    assert "reason=unreachable" in caplog.text
 
 
 # ---------------------------------------------------------------------------

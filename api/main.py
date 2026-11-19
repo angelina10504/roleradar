@@ -619,6 +619,15 @@ def get_pool() -> ConnectionPool:
     min_size=0 because a suspended Neon compute should not be held awake by an
     idle dashboard, and because each serverless instance would otherwise open a
     connection it may never use.
+
+    check: every connection is tested with an empty query before it is handed
+    out. A warm instance keeps this pool while Neon suspends and closes the
+    connections in it, and the pool's own idle pruning runs in threads that are
+    frozen while the instance is idle. Without the check the next request got
+    a closed connection and answered 503. With it, the pool discards that
+    connection and opens another, within the same DB_TIMEOUT. The cost is one
+    round trip per request, and about a second of backoff when a connection
+    is found dead.
     """
     global _pool
     if _pool is None:
@@ -631,6 +640,7 @@ def get_pool() -> ConnectionPool:
                     open=True,
                     kwargs={"row_factory": dict_row},
                     configure=_read_only,
+                    check=ConnectionPool.check_connection,
                 )
     return _pool
 
